@@ -87,6 +87,7 @@ def test_rollout_stop_reason_missing_or_blank_is_unknown(stop_reason):
     ("metadata", "expected_reason"),
     [
         ({"stop_reason": "env_done", "rollout_turns": 3}, "env_done"),
+        ({"stop_reason": "env_error:connection refused", "rollout_turns": 3}, "env_error"),
         ({"rollout_stop_reason": "   ", "stop_reason": "max_turns", "rollout_turns": 3}, "max_turns"),
         (
             {

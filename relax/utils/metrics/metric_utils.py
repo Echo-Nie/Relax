@@ -103,6 +103,8 @@ def compute_rollout_stop_reason_and_turn_metrics(
         reason = sample.metadata.get("rollout_stop_reason")
         if not isinstance(reason, str) or not reason.strip():
             reason = sample.metadata.get("stop_reason")
+            if isinstance(reason, str) and reason.strip():
+                reason = reason.strip().split(":", 1)[0]
         if not isinstance(reason, str) or not reason.strip():
             reason = "unknown"
         else:
