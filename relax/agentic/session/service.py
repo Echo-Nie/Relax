@@ -1430,7 +1430,6 @@ class _SessionRecord:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     live_irs: set[InflightRequest] = field(default_factory=set)
     queued_irs: deque[InflightRequest] = field(default_factory=deque)
-    resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
     protection_pending_until_resume: bool = False
@@ -1908,10 +1907,12 @@ class AgenticSessionShard:
             return False
         async with session.lock:
             forest = session.forest
-            state_hash = session.resp_state_hash_by_request_id.get(request_id)
-            if forest is None or state_hash is None:
+            if forest is None:
                 return False
-            response_node = forest.nodes_by_hash.get(state_hash)
+            generation = forest.committed_generations_by_request_id.get(request_id)
+            if generation is None:
+                return False
+            response_node = forest.nodes_by_hash.get(generation.response_state_hash)
             if response_node is None:
                 return False
             events = agentic_trace_events(response_node.export_metadata_patch)
@@ -2632,7 +2633,11 @@ class AgenticSessionShard:
             rollout_routed_experts=ir.pending_routed_experts,
             export_metadata_patch=ir.pending_export_metadata_patch,
         )
-        session.resp_state_hash_by_request_id[ir.request_id] = response_node.state_hash
+        forest.commit_generation(
+            request_id=ir.request_id,
+            response_state_hash=response_node.state_hash,
+            spec_delta=ir.pending_spec_delta,
+        )
         prompt_tokens = int(ir.latest_backend_meta.get("prompt_tokens", 0))
         completion_tokens = len(ir.pending_token_delta)
         payload = {
@@ -2959,7 +2964,6 @@ class AgenticSessionShard:
             await asyncio.gather(process_wait, return_exceptions=True)
         async with session.lock:
             session.forest = None
-            session.resp_state_hash_by_request_id.clear()
             session.resources = None
         del self._session_records[session.session_id]
 

@@ -324,13 +324,59 @@ def test_session_forest_build_sample_and_session_spec() -> None:
         "export_metadata_patch": {"request_id": "req-build", "base_state_hash": initial_obs.state_hash},
     }
     leaf = forest.append_resp(**response_kwargs)
-    duplicate_leaf = forest.append_resp(**response_kwargs)
+    duplicate_response_kwargs = dict(response_kwargs)
+    duplicate_response_kwargs["export_metadata_patch"] = {
+        "request_id": "req-build-duplicate",
+        "base_state_hash": initial_obs.state_hash,
+    }
+    duplicate_leaf = forest.append_resp(**duplicate_response_kwargs)
     assert duplicate_leaf.state_hash == leaf.state_hash
+
+    forest.commit_generation(
+        request_id="req-build",
+        response_state_hash=leaf.state_hash,
+        spec_delta={
+            "spec_accept_token_num": 1,
+            "spec_draft_token_num": 2,
+            "spec_verify_ct": 3,
+            "completion_token_num": 4,
+        },
+    )
+    forest.commit_generation(
+        request_id="req-build-duplicate",
+        response_state_hash=duplicate_leaf.state_hash,
+        spec_delta={
+            "spec_accept_token_num": 9,
+            "spec_draft_token_num": 10,
+            "spec_verify_ct": 5,
+            "completion_token_num": 6,
+        },
+    )
+
     assert forest.export_leaf_hashes() == [leaf.state_hash]
     sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
     assert (sample.prompt, sample.response, sample.group_index, sample.index) == ("hello", "ok", 3, 7)
     assert sample.train_metadata == {"loss": "grpo"}
-    assert sample.metadata["agentic_trace"]["turn_count"] == 1
+    trace = sample.metadata["agentic_trace"]
+    assert trace["turn_count"] == 1
+    assert trace["spec_generations"] == [
+        {
+            "request_id": "req-build",
+            "resp_state_hash": leaf.state_hash,
+            "spec_accept_token_num": 1,
+            "spec_draft_token_num": 2,
+            "spec_verify_ct": 3,
+            "completion_token_num": 4,
+        },
+        {
+            "request_id": "req-build-duplicate",
+            "resp_state_hash": leaf.state_hash,
+            "spec_accept_token_num": 9,
+            "spec_draft_token_num": 10,
+            "spec_verify_ct": 5,
+            "completion_token_num": 6,
+        },
+    ]
     sample.sampling_params = {"temperature": 0.2}
     (session_spec,) = _build_session_specs(
         [sample],

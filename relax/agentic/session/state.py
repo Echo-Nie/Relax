@@ -358,6 +358,12 @@ class MsgNode:
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class CommittedGeneration:
+    response_state_hash: str
+    spec_delta: dict[str, int]
+
+
 @dataclass(eq=False)
 class InflightRequest:
     request_id: str
@@ -408,6 +414,7 @@ class SessionForest:
     root_state_hash: str | None = None
     leaf_state_hashes: set[str] = field(default_factory=set)
     nodes_by_hash: dict[str, MsgNode] = field(default_factory=dict)
+    committed_generations_by_request_id: dict[str, CommittedGeneration] = field(default_factory=dict)
 
     @classmethod
     def create_empty(
@@ -503,6 +510,18 @@ class SessionForest:
 
     def export_leaf_hashes(self) -> list[str]:
         return list(self.leaf_state_hashes)
+
+    def commit_generation(
+        self,
+        *,
+        request_id: str,
+        response_state_hash: str,
+        spec_delta: dict[str, int],
+    ) -> None:
+        self.committed_generations_by_request_id[request_id] = CommittedGeneration(
+            response_state_hash=response_state_hash,
+            spec_delta=dict(spec_delta),
+        )
 
     def subtree_root_node(self, state_hash: str | None) -> MsgNode | None:
         if state_hash is None:
@@ -695,6 +714,7 @@ class SessionForest:
         rollout_log_probs: list[float] = []
         messages: list[dict[str, Any]] = []
         turns: list[dict[str, Any]] = []
+        response_state_hashes: set[str] = set()
         response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
@@ -715,6 +735,7 @@ class SessionForest:
             if node.kind == "resp":
                 if first_response_node is None:
                     first_response_node = node
+                response_state_hashes.add(node.state_hash)
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
                 response_start = len(continuation_train_tokens)
                 continuation_train_tokens.extend(node.train_token_delta)
@@ -745,6 +766,15 @@ class SessionForest:
             normalize_template_kwargs(subtree_root.chat_template_kwargs) if subtree_root is not None else {}
         )
         status = Sample.Status.TRUNCATED if leaf.kind == "obs" else Sample.Status(leaf.status)
+        spec_generations = [
+            {
+                "request_id": request_id,
+                "resp_state_hash": generation.response_state_hash,
+                **generation.spec_delta,
+            }
+            for request_id, generation in self.committed_generations_by_request_id.items()
+            if generation.response_state_hash in response_state_hashes
+        ]
         trace = merge_agentic_trace(merged_metadata.get(TRACE_KEY), None)
         trace.update(
             {
@@ -753,6 +783,7 @@ class SessionForest:
                 "terminal_status": status.value,
                 "turn_count": len(turns),
                 "turns": turns,
+                "spec_generations": spec_generations,
             }
         )
         merged_metadata[TRACE_KEY] = trace
