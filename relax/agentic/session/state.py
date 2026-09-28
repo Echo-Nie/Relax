@@ -29,14 +29,9 @@ class RequestKind(str, Enum):
     PROTECTED = "protected"
 
 
-# Zero-valued SGLang accounting shape merged across interrupted IR attempts.
-# Keys are part of exported metadata and therefore must track backend schema.
-_EMPTY_SPEC_DELTA = {
-    "spec_accept_token_num": 0,
-    "spec_draft_token_num": 0,
-    "spec_verify_ct": 0,
-    "completion_token_num": 0,
-}
+# Speculative counters are sparse so an absent key remains distinguishable
+# from a counter explicitly reported as zero by the backend.
+_EMPTY_SPEC_DELTA: dict[str, int] = {}
 # Zero-valued prefix-cache accounting shape accumulated across resumptions.
 _EMPTY_PREFIX_CACHE_DELTA = {
     "cached_tokens": 0,

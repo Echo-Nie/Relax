@@ -1642,11 +1642,23 @@ class AgenticSessionShard:
         weight_version = meta_info.get("weight_version")
         if weight_version is not None:
             request.pending_weight_version_delta.append(str(weight_version))
-        spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
-        request.pending_spec_delta["spec_accept_token_num"] += spec_accept_token_num
-        request.pending_spec_delta["spec_draft_token_num"] += spec_draft_token_num
-        request.pending_spec_delta["spec_verify_ct"] += int(meta_info.get("spec_verify_ct", 0) or 0)
-        request.pending_spec_delta["completion_token_num"] += int(meta_info.get("completion_tokens", 0) or 0)
+        spec_token_counts = get_spec_token_counts(meta_info)
+        if spec_token_counts is not None:
+            spec_accept_token_num, spec_draft_token_num = spec_token_counts
+            request.pending_spec_delta["spec_accept_token_num"] = (
+                request.pending_spec_delta.get("spec_accept_token_num", 0) + spec_accept_token_num
+            )
+            request.pending_spec_delta["spec_draft_token_num"] = (
+                request.pending_spec_delta.get("spec_draft_token_num", 0) + spec_draft_token_num
+            )
+        if "spec_verify_ct" in meta_info:
+            request.pending_spec_delta["spec_verify_ct"] = request.pending_spec_delta.get("spec_verify_ct", 0) + int(
+                meta_info.get("spec_verify_ct", 0) or 0
+            )
+        if "completion_tokens" in meta_info:
+            request.pending_spec_delta["completion_token_num"] = request.pending_spec_delta.get(
+                "completion_token_num", 0
+            ) + int(meta_info.get("completion_tokens", 0) or 0)
         request.pending_prefix_cache_delta["cached_tokens"] += int(meta_info.get("cached_tokens", 0) or 0)
         request.pending_prefix_cache_delta["total_prompt_tokens"] += int(meta_info.get("prompt_tokens", 0) or 0)
 

@@ -347,6 +347,62 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     assert session_spec.input_payload["messages"] == [{"role": "user", "content": "hello"}]
 
 
+def test_accumulate_request_meta_preserves_missing_zero_and_accumulates() -> None:
+    request = SimpleNamespace(
+        pending_weight_version_delta=[],
+        pending_spec_delta={},
+        pending_prefix_cache_delta={
+            "cached_tokens": 0,
+            "total_prompt_tokens": 0,
+        },
+    )
+
+    AgenticSessionShard._accumulate_request_meta(request, meta_info={})
+    assert request.pending_spec_delta == {}
+
+    AgenticSessionShard._accumulate_request_meta(
+        request,
+        meta_info={
+            "spec_num_correct_drafts": 0,
+            "spec_num_proposed_drafts": 0,
+            "spec_verify_ct": 0,
+            "completion_tokens": 0,
+        },
+    )
+    assert request.pending_spec_delta == {
+        "spec_accept_token_num": 0,
+        "spec_draft_token_num": 0,
+        "spec_verify_ct": 0,
+        "completion_token_num": 0,
+    }
+
+    AgenticSessionShard._accumulate_request_meta(
+        request,
+        meta_info={
+            "spec_num_correct_drafts": 1,
+            "spec_num_proposed_drafts": 2,
+            "spec_verify_ct": 3,
+            "completion_tokens": 4,
+        },
+    )
+    AgenticSessionShard._accumulate_request_meta(
+        request,
+        meta_info={
+            "spec_num_correct_drafts": 3,
+            "spec_num_proposed_drafts": 4,
+            "spec_verify_ct": 5,
+            "completion_tokens": 6,
+        },
+    )
+
+    assert request.pending_spec_delta == {
+        "spec_accept_token_num": 4,
+        "spec_draft_token_num": 6,
+        "spec_verify_ct": 8,
+        "completion_token_num": 10,
+    }
+
+
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:
     handle = SimpleNamespace(
         start_group=SimpleNamespace(remote=AsyncMock()),
