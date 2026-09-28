@@ -1,3 +1,6 @@
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,15 +14,21 @@ from relax.utils.failure_events import FailureEvent, FailureEventStore
 NAMESPACE = "relax_failure_events"
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def ray_runtime():
-    started = not ray.is_initialized()
-    if started:
-        ray.init(address="auto")
+    connected_here = False
 
-    yield
+    if not ray.is_initialized():
+        try:
+            ray.init(address="auto")
+        except ConnectionError:
+            ray.init(num_cpus=1, include_dashboard=False)
+        connected_here = True
 
-    if started:
+    address = ray.get_runtime_context().gcs_address
+    yield address
+
+    if connected_here:
         ray.shutdown()
 
 
@@ -41,32 +50,49 @@ def kill_store(name: str):
     ray.kill(store)
 
 
-def test_detached_store_survives_driver_reconnect(ray_runtime):
+def test_detached_store_survives_driver_exit(ray_runtime):
     name = "failure_event_test_reconnect"
-
     kill_store(name)
 
-    store = create_store(name)
-    ray.get(
-        store.append.remote(
-            FailureEvent(
-                fault_id="fault-1",
-                role="actor",
-                phase="detected",
-                occurred_at_ms=1,
-            )
+    code = f"""
+import ray
+
+from relax.utils.failure_events import FailureEvent, FailureEventStore
+
+ray.init(address={ray_runtime!r})
+
+store_actor = ray.remote(num_cpus=0)(FailureEventStore)
+store = store_actor.options(
+    name={name!r},
+    namespace={NAMESPACE!r},
+    lifetime="detached",
+    get_if_exists=True,
+).remote(16)
+
+ray.get(
+    store.append.remote(
+        FailureEvent(
+            fault_id="fault-1",
+            role="actor",
+            phase="detected",
+            occurred_at_ms=1,
         )
     )
+)
+"""
 
-    ray.shutdown()
-    ray.init(address="auto")
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        check=True,
+    )
 
-    reconnected = ray.get_actor(name, namespace=NAMESPACE)
-    page = ray.get(reconnected.query.remote())
+    store = ray.get_actor(name, namespace=NAMESPACE)
+    page = ray.get(store.query.remote())
 
     assert [event["fault_id"] for event in page["events"]] == ["fault-1"]
 
-    ray.kill(reconnected)
+    ray.kill(store)
 
 
 def test_different_store_names_do_not_share_history(ray_runtime):
@@ -108,9 +134,7 @@ def test_controller_shutdown_kills_failure_event_store(ray_runtime):
 
     controller = Controller.__new__(Controller)
     controller._failure_event_store = store
-    controller._health_manager = SimpleNamespace(
-        stop=Mock(),
-    )
+    controller._health_manager = SimpleNamespace(stop=Mock())
     controller.serve_dict = {}
     controller._teacher_manager = None
     controller._shutdown_agentic_rollout_services = Mock()
