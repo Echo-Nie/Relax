@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from relax.agentic.session.service import AgenticSessionShard
+from relax.agentic.session.state import SessionForest
 from relax.distributed.ray.rollout import _compute_spec_metrics
 from relax.utils.types import Sample
 
@@ -194,3 +196,121 @@ def test_spec_metrics_disabled_returns_no_metrics() -> None:
     args = SimpleNamespace(sglang_speculative_algorithm=None)
 
     assert _compute_spec_metrics(args, []) == {}
+
+
+class _CharTokenizer:
+    def decode(self, token_ids, skip_special_tokens=False):
+        return "".join(chr(token_id) for token_id in token_ids)
+
+
+def _commit_agentic_generation(
+    forest: SessionForest,
+    *,
+    parent_state_hash: str,
+    request_id: str,
+    text: str,
+    meta_info: dict,
+):
+    request = SimpleNamespace(
+        pending_weight_version_delta=[],
+        pending_spec_delta={},
+        pending_prefix_cache_delta={
+            "cached_tokens": 0,
+            "total_prompt_tokens": 0,
+        },
+    )
+    AgenticSessionShard._accumulate_request_meta(request, meta_info=meta_info)
+
+    node = forest.append_resp(
+        parent_state_hash=parent_state_hash,
+        rollout_id=1,
+        abort_count=0,
+        messages_delta=[
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+            }
+        ],
+        token_delta=[ord(char) for char in text],
+        logprob_delta=[0.0] * len(text),
+        spec_delta=request.pending_spec_delta,
+        status="completed",
+        export_metadata_patch={
+            "request_id": request_id,
+            "base_state_hash": parent_state_hash,
+        },
+    )
+    forest.commit_generation(
+        request_id=request_id,
+        response_state_hash=node.state_hash,
+        spec_delta=request.pending_spec_delta,
+    )
+    return node
+
+
+def test_agentic_spec_metrics_pipeline_deduplicates_shared_generation() -> None:
+    forest = SessionForest.create_empty(session_id="session-integration")
+    assert forest.root_state_hash is not None
+
+    generation_a = _commit_agentic_generation(
+        forest,
+        parent_state_hash=forest.root_state_hash,
+        request_id="A",
+        text="A",
+        meta_info={
+            "spec_num_correct_drafts": 1,
+            "spec_num_proposed_drafts": 2,
+            "spec_verify_ct": 1,
+            "completion_tokens": 2,
+        },
+    )
+    generation_b = _commit_agentic_generation(
+        forest,
+        parent_state_hash=generation_a.state_hash,
+        request_id="B",
+        text="B",
+        meta_info={
+            "spec_num_correct_drafts": 2,
+            "spec_num_proposed_drafts": 4,
+            "spec_verify_ct": 2,
+            "completion_tokens": 3,
+        },
+    )
+    generation_c = _commit_agentic_generation(
+        forest,
+        parent_state_hash=generation_a.state_hash,
+        request_id="C",
+        text="C",
+        meta_info={
+            "spec_num_correct_drafts": 9,
+            "spec_num_proposed_drafts": 10,
+            "spec_verify_ct": 3,
+            "completion_tokens": 6,
+        },
+    )
+
+    tokenizer = _CharTokenizer()
+    sample_ab = forest.build_sample(
+        leaf_state_hash=generation_b.state_hash,
+        tokenizer=tokenizer,
+    )
+    sample_ac = forest.build_sample(
+        leaf_state_hash=generation_c.state_hash,
+        tokenizer=tokenizer,
+    )
+
+    assert [generation["request_id"] for generation in sample_ab.metadata["agentic_trace"]["spec_generations"]] == [
+        "A",
+        "B",
+    ]
+    assert [generation["request_id"] for generation in sample_ac.metadata["agentic_trace"]["spec_generations"]] == [
+        "A",
+        "C",
+    ]
+
+    metrics = _compute_spec_metrics(_args(), [sample_ab, sample_ac])
+
+    assert metrics["spec_accept_rate"] == pytest.approx(12 / 16)
+    assert metrics["spec_accept_length"] == pytest.approx(11 / 6)
+    assert metrics["spec_accept_rate_coverage"] == 1.0
+    assert metrics["spec_accept_length_coverage"] == 1.0
