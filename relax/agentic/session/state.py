@@ -358,6 +358,7 @@ class MsgNode:
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
 
 
+# Generation identity stays request-scoped even when semantic states share the same state_hash.
 @dataclass(frozen=True)
 class CommittedGeneration:
     response_state_hash: str
@@ -766,6 +767,7 @@ class SessionForest:
             normalize_template_kwargs(subtree_root.chat_template_kwargs) if subtree_root is not None else {}
         )
         status = Sample.Status.TRUNCATED if leaf.kind == "obs" else Sample.Status(leaf.status)
+        # Export only committed generations whose response state is covered by this sample lineage.
         spec_generations = [
             {
                 "request_id": request_id,

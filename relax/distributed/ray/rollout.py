@@ -4940,6 +4940,7 @@ def _compute_spec_metrics(args, all_samples: list[Sample]):
     if getattr(args, "sglang_speculative_algorithm", None) is None:
         return {}
 
+    # Deduplicate shared generations by request ID within each session.
     generations: dict[tuple[str, str], dict[str, Any]] = {}
     legacy_spec_infos: list[Sample.SpecInfo] = []
 
@@ -4987,6 +4988,7 @@ def _compute_spec_metrics(args, all_samples: list[Sample]):
         "spec_accept_rate_coverage": accept_covered / record_count if record_count else 0.0,
         "spec_accept_length_coverage": length_covered / record_count if record_count else 0.0,
     }
+    # Compute ratios only after the underlying counters have been aggregated.
     if proposed > 0:
         metrics["spec_accept_rate"] = accepted / proposed
     if verify > 0:
