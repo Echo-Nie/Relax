@@ -4,7 +4,7 @@ import pytest
 
 from relax.agentic.session.service import AgenticSessionShard
 from relax.agentic.session.state import SessionForest
-from relax.distributed.ray.rollout import _compute_spec_metrics
+from relax.utils.metrics.speculative import compute_spec_metrics
 from relax.utils.types import Sample
 
 
@@ -60,7 +60,7 @@ def test_spec_metrics_weight_raw_counters_before_division() -> None:
         ),
     ]
 
-    metrics = _compute_spec_metrics(_args(), samples)
+    metrics = compute_spec_metrics(_args(), samples)
 
     assert metrics["spec_accept_rate"] == pytest.approx(10 / 12)
     assert metrics["spec_accept_length"] == pytest.approx(12 / 6)
@@ -85,7 +85,7 @@ def test_spec_metrics_deduplicate_shared_generation_within_session() -> None:
         ],
     )
 
-    metrics = _compute_spec_metrics(_args(), [sample_ab, sample_ac])
+    metrics = compute_spec_metrics(_args(), [sample_ab, sample_ac])
 
     assert metrics["spec_accept_rate"] == pytest.approx(12 / 16)
     assert metrics["spec_accept_length"] == pytest.approx(11 / 6)
@@ -103,7 +103,7 @@ def test_spec_metrics_scope_request_id_by_session() -> None:
         [_generation("same-request", accepted=9, proposed=10)],
     )
 
-    metrics = _compute_spec_metrics(_args(), [first, second])
+    metrics = compute_spec_metrics(_args(), [first, second])
 
     assert metrics["spec_accept_rate"] == pytest.approx(10 / 12)
     assert metrics["spec_accept_rate_coverage"] == 1.0
@@ -119,7 +119,7 @@ def test_spec_metrics_report_missing_and_explicit_zero_coverage() -> None:
         ],
     )
 
-    metrics = _compute_spec_metrics(_args(), [sample])
+    metrics = compute_spec_metrics(_args(), [sample])
 
     assert metrics["spec_accept_rate"] == 0.0
     assert metrics["spec_accept_rate_coverage"] == pytest.approx(2 / 3)
@@ -133,7 +133,7 @@ def test_spec_metrics_do_not_fabricate_rate_for_zero_denominator() -> None:
         [_generation("zero-denominator", accepted=0, proposed=0, verify=0, completion=0)],
     )
 
-    metrics = _compute_spec_metrics(_args(), [sample])
+    metrics = compute_spec_metrics(_args(), [sample])
 
     assert "spec_accept_rate" not in metrics
     assert "spec_accept_length" not in metrics
@@ -142,7 +142,7 @@ def test_spec_metrics_do_not_fabricate_rate_for_zero_denominator() -> None:
 
 
 def test_spec_metrics_empty_input_has_only_zero_coverage() -> None:
-    metrics = _compute_spec_metrics(_args(), [])
+    metrics = compute_spec_metrics(_args(), [])
 
     assert metrics == {
         "spec_accept_rate_coverage": 0.0,
@@ -166,7 +166,7 @@ def test_spec_metrics_legacy_samples_use_weighted_fallback() -> None:
         completion_token_num=9,
     )
 
-    metrics = _compute_spec_metrics(_args(), [first, second])
+    metrics = compute_spec_metrics(_args(), [first, second])
 
     assert metrics["spec_accept_rate"] == pytest.approx(10 / 12)
     assert metrics["spec_accept_length"] == pytest.approx(12 / 6)
@@ -184,7 +184,7 @@ def test_spec_metrics_legacy_zero_defaults_are_treated_as_uncovered() -> None:
     }
     legacy = Sample.from_dict(serialized)
 
-    metrics = _compute_spec_metrics(_args(), [legacy])
+    metrics = compute_spec_metrics(_args(), [legacy])
 
     assert "spec_accept_rate" not in metrics
     assert "spec_accept_length" not in metrics
@@ -195,7 +195,7 @@ def test_spec_metrics_legacy_zero_defaults_are_treated_as_uncovered() -> None:
 def test_spec_metrics_disabled_returns_no_metrics() -> None:
     args = SimpleNamespace(sglang_speculative_algorithm=None)
 
-    assert _compute_spec_metrics(args, []) == {}
+    assert compute_spec_metrics(args, []) == {}
 
 
 class _CharTokenizer:
@@ -308,7 +308,7 @@ def test_agentic_spec_metrics_pipeline_deduplicates_shared_generation() -> None:
         "C",
     ]
 
-    metrics = _compute_spec_metrics(_args(), [sample_ab, sample_ac])
+    metrics = compute_spec_metrics(_args(), [sample_ab, sample_ac])
 
     assert metrics["spec_accept_rate"] == pytest.approx(12 / 16)
     assert metrics["spec_accept_length"] == pytest.approx(11 / 6)
@@ -335,7 +335,7 @@ def test_spec_metrics_count_independent_requests_with_same_state() -> None:
         ],
     )
 
-    metrics = _compute_spec_metrics(_args(), [sample])
+    metrics = compute_spec_metrics(_args(), [sample])
 
     assert metrics["spec_accept_rate"] == pytest.approx(10 / 12)
     assert metrics["spec_accept_rate_coverage"] == 1.0
@@ -392,7 +392,7 @@ def test_agentic_spec_metrics_exclude_unexported_committed_branch() -> None:
         "B",
     ]
 
-    metrics = _compute_spec_metrics(_args(), [sample_ab])
+    metrics = compute_spec_metrics(_args(), [sample_ab])
 
     assert metrics["spec_accept_rate"] == pytest.approx(3 / 6)
     assert metrics["spec_accept_length"] == pytest.approx(5 / 3)

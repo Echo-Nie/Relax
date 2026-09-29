@@ -48,6 +48,7 @@ from relax.utils.metrics.metric_utils import (
     dict_add_prefix,
     has_repetition,
 )
+from relax.utils.metrics.speculative import compute_spec_metrics
 from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
@@ -4937,63 +4938,7 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
 
 
 def _compute_spec_metrics(args, all_samples: list[Sample]):
-    if getattr(args, "sglang_speculative_algorithm", None) is None:
-        return {}
-
-    # Deduplicate shared generations by request ID within each session.
-    generations: dict[tuple[str, str], dict[str, Any]] = {}
-    legacy_spec_infos: list[Sample.SpecInfo] = []
-
-    for sample in all_samples:
-        trace = sample.metadata.get("agentic_trace")
-        if isinstance(trace, dict) and "spec_generations" in trace:
-            session_id = trace["session_id"]
-            for generation in trace["spec_generations"]:
-                generations[(session_id, generation["request_id"])] = generation
-        else:
-            legacy_spec_infos.append(sample.spec_info)
-
-    record_count = len(generations) + len(legacy_spec_infos)
-    accepted = 0
-    proposed = 0
-    accept_covered = 0
-    verify = 0
-    completion = 0
-    length_covered = 0
-
-    for generation in generations.values():
-        if "spec_accept_token_num" in generation and "spec_draft_token_num" in generation:
-            accepted += generation["spec_accept_token_num"]
-            proposed += generation["spec_draft_token_num"]
-            accept_covered += 1
-        if "spec_verify_ct" in generation and "completion_token_num" in generation:
-            verify += generation["spec_verify_ct"]
-            completion += generation["completion_token_num"]
-            length_covered += 1
-
-    # Legacy samples do not preserve whether a zero counter was explicitly
-    # reported or defaulted during deserialization. A positive denominator is
-    # the only reliable evidence that the corresponding counter pair exists.
-    for spec_info in legacy_spec_infos:
-        if spec_info.spec_draft_token_num > 0:
-            accepted += spec_info.spec_accept_token_num
-            proposed += spec_info.spec_draft_token_num
-            accept_covered += 1
-        if spec_info.spec_verify_ct > 0:
-            verify += spec_info.spec_verify_ct
-            completion += spec_info.completion_token_num
-            length_covered += 1
-
-    metrics = {
-        "spec_accept_rate_coverage": accept_covered / record_count if record_count else 0.0,
-        "spec_accept_length_coverage": length_covered / record_count if record_count else 0.0,
-    }
-    # Compute ratios only after the underlying counters have been aggregated.
-    if proposed > 0:
-        metrics["spec_accept_rate"] = accepted / proposed
-    if verify > 0:
-        metrics["spec_accept_length"] = completion / verify
-    return metrics
+    return compute_spec_metrics(args, all_samples)
 
 
 def _compute_prefix_cache_metrics(args, all_samples: list[Sample]):
