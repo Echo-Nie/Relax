@@ -4859,7 +4859,7 @@ def compute_metrics_from_samples(
         include_rloo_diagnostics=include_rloo_diagnostics,
     )
     log_dict |= _compute_zero_std_metrics(args, rewarded_samples)
-    log_dict |= _compute_spec_metrics(args, samples)
+    log_dict |= compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, reward_category_samples)
     log_dict |= compute_mopd_metrics(args, rewarded_samples)
@@ -4935,10 +4935,6 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
 
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
-
-
-def _compute_spec_metrics(args, all_samples: list[Sample]):
-    return compute_spec_metrics(args, all_samples)
 
 
 def _compute_prefix_cache_metrics(args, all_samples: list[Sample]):

@@ -359,6 +359,12 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     assert sample.train_metadata == {"loss": "grpo"}
     trace = sample.metadata["agentic_trace"]
     assert trace["turn_count"] == 1
+    assert sample.spec_info.to_dict() == {
+        "spec_accept_token_num": 10,
+        "spec_draft_token_num": 12,
+        "spec_verify_ct": 8,
+        "completion_token_num": 10,
+    }
     assert trace["spec_generations"] == [
         {
             "request_id": "req-build",

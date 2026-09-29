@@ -347,7 +347,6 @@ class MsgNode:
     backend_audio_data_delta: list[str] = field(default_factory=list)
     backend_video_data_delta: list[str] = field(default_factory=list)
     weight_version_delta: list[str] = field(default_factory=list)
-    spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
@@ -639,7 +638,6 @@ class SessionForest:
         token_delta: list[int],
         logprob_delta: list[float],
         weight_version_delta: list[str] | None = None,
-        spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
         generation_elapsed_s: float = 0.0,
@@ -665,7 +663,6 @@ class SessionForest:
                 rollout_token_delta=token_delta,
                 logprob_delta=logprob_delta,
                 weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
-                spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
                 prefix_cache_delta=prefix_cache_delta
                 if prefix_cache_delta is not None
                 else dict(_EMPTY_PREFIX_CACHE_DELTA),
@@ -719,7 +716,6 @@ class SessionForest:
         response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
-        spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
@@ -744,7 +740,6 @@ class SessionForest:
                 loss_mask.extend([1] * len(node.train_token_delta))
                 rollout_log_probs.extend(node.logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
-                spec_info = _sum_counter_dict(spec_info, node.spec_delta)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
                 continue
             if idx == 0 or first_response_node is None:
@@ -767,16 +762,21 @@ class SessionForest:
             normalize_template_kwargs(subtree_root.chat_template_kwargs) if subtree_root is not None else {}
         )
         status = Sample.Status.TRUNCATED if leaf.kind == "obs" else Sample.Status(leaf.status)
-        # Export only committed generations whose response state is covered by this sample lineage.
-        spec_generations = [
-            {
-                "request_id": request_id,
-                "resp_state_hash": generation.response_state_hash,
-                **generation.spec_delta,
-            }
-            for request_id, generation in self.committed_generations_by_request_id.items()
-            if generation.response_state_hash in response_state_hashes
-        ]
+        # State membership defines export coverage; request_id keeps independent
+        # committed generations distinct when requests converge to the same state.
+        spec_info = dict(_EMPTY_SPEC_DELTA)
+        spec_generations = []
+        for request_id, generation in self.committed_generations_by_request_id.items():
+            if generation.response_state_hash not in response_state_hashes:
+                continue
+            spec_info = _sum_counter_dict(spec_info, generation.spec_delta)
+            spec_generations.append(
+                {
+                    "request_id": request_id,
+                    "resp_state_hash": generation.response_state_hash,
+                    **generation.spec_delta,
+                }
+            )
         trace = merge_agentic_trace(merged_metadata.get(TRACE_KEY), None)
         trace.update(
             {

@@ -233,7 +233,6 @@ def _commit_agentic_generation(
         ],
         token_delta=[ord(char) for char in text],
         logprob_delta=[0.0] * len(text),
-        spec_delta=request.pending_spec_delta,
         status="completed",
         export_metadata_patch={
             "request_id": request_id,

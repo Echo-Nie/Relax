@@ -2625,7 +2625,6 @@ class AgenticSessionShard:
             token_delta=ir.pending_token_delta,
             logprob_delta=ir.pending_logprob_delta,
             weight_version_delta=ir.pending_weight_version_delta,
-            spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,
             generation_elapsed_s=ir.pending_generation_elapsed_s,

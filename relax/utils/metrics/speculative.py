@@ -9,7 +9,7 @@ def compute_spec_metrics(args, all_samples: list[Sample]) -> dict[str, Any]:
 
     # Deduplicate shared generations by request ID within each session.
     generations: dict[tuple[str, str], dict[str, Any]] = {}
-    legacy_spec_infos: list[Sample.SpecInfo] = []
+    fallback_spec_infos: list[Sample.SpecInfo] = []
 
     for sample in all_samples:
         trace = sample.metadata.get("agentic_trace")
@@ -18,9 +18,9 @@ def compute_spec_metrics(args, all_samples: list[Sample]) -> dict[str, Any]:
             for generation in trace["spec_generations"]:
                 generations[(session_id, generation["request_id"])] = generation
         else:
-            legacy_spec_infos.append(sample.spec_info)
+            fallback_spec_infos.append(sample.spec_info)
 
-    record_count = len(generations) + len(legacy_spec_infos)
+    record_count = len(generations) + len(fallback_spec_infos)
     accepted = 0
     proposed = 0
     accept_covered = 0
@@ -38,8 +38,8 @@ def compute_spec_metrics(args, all_samples: list[Sample]) -> dict[str, Any]:
             completion += generation["completion_token_num"]
             length_covered += 1
 
-    # Legacy samples cannot distinguish explicit zero from historical defaults.
-    for spec_info in legacy_spec_infos:
+    # Samples without generation-level accounting cannot distinguish explicit zero from historical defaults.
+    for spec_info in fallback_spec_infos:
         if spec_info.spec_draft_token_num > 0:
             accepted += spec_info.spec_accept_token_num
             proposed += spec_info.spec_draft_token_num
