@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from typing import Any
 
 from relax.utils.types import Sample
