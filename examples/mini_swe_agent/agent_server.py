@@ -498,14 +498,9 @@ def _r2e_reward(row: dict[str, Any], output: str) -> float:
     expected = _decolor_dict_keys(json.loads(row["expected_output_json"]))
     parsed = {key.split(" - ")[0]: parsed[key] for key in sorted(parsed.keys())}
     expected = {key.split(" - ")[0]: expected[key] for key in sorted(expected.keys())}
-    if len(parsed) != len(expected):
+    if not parsed or "" in parsed:
         return 0.0
-    for key in parsed.keys():
-        if not key:
-            continue
-        if key not in expected or parsed[key] != expected[key]:
-            return 0.0
-    return 1.0
+    return 1.0 if parsed == expected else 0.0
 
 
 def make_test_spec_without_deps(row: dict[str, Any]) -> "TestSpec":
