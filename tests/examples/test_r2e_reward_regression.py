@@ -51,6 +51,30 @@ HEADER = "short test summary info\n"
 
 CASES = [
     (
+        "failed_assertion_mentions_passed",
+        {"test_status": "PASSED"},
+        HEADER + "FAILED test_status.py::test_status - AssertionError: assert 'PASSED' == 'FAILED'\n",
+        0.0,
+    ),
+    (
+        "failed_expected_failed",
+        {"test_status": "FAILED"},
+        HEADER + "FAILED test_status.py::test_status - AssertionError: assert 'PASSED' == 'FAILED'\n",
+        1.0,
+    ),
+    (
+        "colored_failed_summary",
+        {"test_status": "FAILED"},
+        HEADER + "\x1b[31mFAILED\x1b[0m test_status.py::test_status - AssertionError\n",
+        1.0,
+    ),
+    (
+        "error_message_mentions_passed",
+        {"test_status": "ERROR"},
+        HEADER + "ERROR test_status.py::test_status - RuntimeError: 'PASSED'\n",
+        1.0,
+    ),
+    (
         "valid_success",
         {"test_valid": "PASSED"},
         HEADER + "PASSED tests/test_calc.py::test_valid\n",

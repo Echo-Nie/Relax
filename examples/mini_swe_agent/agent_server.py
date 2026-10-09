@@ -446,12 +446,12 @@ def _parse_log_pytest(log: str | None) -> dict[str, str]:
         return {}
     status_map: dict[str, str] = {}
     for line in log.split("short test summary info", 1)[1].strip().splitlines():
-        if "PASSED" in line:
-            status_map[".".join(line.split("::")[1:])] = "PASSED"
-        elif "FAILED" in line:
-            status_map[".".join(line.split("::")[1:]).split(" - ")[0]] = "FAILED"
-        elif "ERROR" in line:
-            status_map[".".join(line.split("::")[1:]).split(" - ")[0]] = "ERROR"
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        status, _, test_name = line.partition(" ")
+        if status not in ("PASSED", "FAILED", "ERROR"):
+            continue
+        test_id = ".".join(test_name.split(" - ", 1)[0].split("::")[1:])
+        status_map[test_id] = status
     return status_map
 
 
@@ -500,7 +500,9 @@ def _r2e_reward(row: dict[str, Any], output: str) -> float:
     expected = {key.split(" - ")[0]: expected[key] for key in sorted(expected.keys())}
     if not parsed or "" in parsed:
         return 0.0
-    return 1.0 if parsed == expected else 0.0
+    if parsed != expected:
+        return 0.0
+    return 1.0
 
 
 def make_test_spec_without_deps(row: dict[str, Any]) -> "TestSpec":
