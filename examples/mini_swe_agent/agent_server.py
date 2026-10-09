@@ -494,9 +494,8 @@ def _format_command_result(label: str, result: dict[str, Any]) -> str:
 
 
 def _r2e_reward(row: dict[str, Any], output: str) -> float:
-    parsed = _decolor_dict_keys(_parse_log_pytest(output))
+    parsed = _parse_log_pytest(output)
     expected = _decolor_dict_keys(json.loads(row["expected_output_json"]))
-    parsed = {key.split(" - ")[0]: parsed[key] for key in sorted(parsed.keys())}
     expected = {key.split(" - ")[0]: expected[key] for key in sorted(expected.keys())}
     if not parsed or "" in parsed:
         return 0.0

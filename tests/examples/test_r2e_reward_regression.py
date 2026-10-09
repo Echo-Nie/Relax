@@ -1,4 +1,4 @@
-"""Regression tests for Mini-SWE-Agent R2E reward scoring."""
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import ast
 import json
@@ -50,6 +50,18 @@ def score(expected, output):
 HEADER = "short test summary info\n"
 
 CASES = [
+    (
+        "colored_bold_test_id",
+        {"test_status": "PASSED"},
+        HEADER + "\x1b[32mPASSED\x1b[0m test_status.py::\x1b[1mtest_status\x1b[0m\n",
+        1.0,
+    ),
+    (
+        "non_scored_statuses_ignored",
+        {"test_status": "PASSED"},
+        HEADER + "SKIPPED [1] test_status.py:9: skip if FAILED to import\n" + "PASSED test_status.py::test_status\n",
+        1.0,
+    ),
     (
         "failed_assertion_mentions_passed",
         {"test_status": "PASSED"},
