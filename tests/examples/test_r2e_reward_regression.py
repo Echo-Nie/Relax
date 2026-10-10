@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""JUnit XML scoring regressions without importing Agent Server runtime deps."""
+"""JUnit XML scoring regressions without importing Agent Server runtime
+deps."""
 
 import ast
 import json
@@ -51,14 +52,29 @@ def report(*cases):
 
 CASES = [
     ("passed", {"test_ok": "PASSED"}, report(_case("test_ok")), 1.0),
-    ("failed_mentions_passed", {"test_ok": "PASSED"}, report(_case("test_ok", "FAILED", message="assert 'PASSED' == 'FAILED'")), 0.0),
+    (
+        "failed_mentions_passed",
+        {"test_ok": "PASSED"},
+        report(_case("test_ok", "FAILED", message="assert 'PASSED' == 'FAILED'")),
+        0.0,
+    ),
     ("expected_failed", {"test_ok": "FAILED"}, report(_case("test_ok", "FAILED")), 1.0),
     ("expected_error", {"test_ok": "ERROR"}, report(_case("test_ok", "ERROR", message="PASSED")), 1.0),
     ("error_mismatch", {"test_ok": "PASSED"}, report(_case("test_ok", "ERROR")), 0.0),
-    ("class_method", {"TestMath.test_add": "PASSED"}, report(_case("test_add", classname="r2e_tests.test_calc.TestMath")), 1.0),
+    (
+        "class_method",
+        {"TestMath.test_add": "PASSED"},
+        report(_case("test_add", classname="r2e_tests.test_calc.TestMath")),
+        1.0,
+    ),
     ("parametrized", {"test_add[1]": "PASSED"}, report(_case("test_add[1]")), 1.0),
     ("skipped_ignored", {"test_ok": "PASSED"}, report(_case("test_skip", "SKIPPED"), _case("test_ok")), 1.0),
-    ("xfail_ignored", {"test_ok": "PASSED"}, report(_case("test_xfail", "SKIPPED", message="xfail"), _case("test_ok")), 1.0),
+    (
+        "xfail_ignored",
+        {"test_ok": "PASSED"},
+        report(_case("test_xfail", "SKIPPED", message="xfail"), _case("test_ok")),
+        1.0,
+    ),
     ("empty", {}, report(), 0.0),
     ("missing_report", {"test_ok": "PASSED"}, "", 0.0),
     ("malformed_xml", {"test_ok": "PASSED"}, "<testsuites>", 0.0),
@@ -92,8 +108,7 @@ def test_real_pytest_junit_xml(tmp_path):
     )
     script = tmp_path / "run_tests.sh"
     script.write_text(
-        f"#!/bin/bash\n{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider "
-        f"{shlex.quote(str(sample))}\n",
+        f"#!/bin/bash\n{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider {shlex.quote(str(sample))}\n",
         encoding="utf-8",
     )
     xml_path = tmp_path / "results.xml"

@@ -467,7 +467,7 @@ def _parse_junit_xml(report: str) -> dict[str, str]:
         module = Path(file).with_suffix("").as_posix().replace("/", ".")
         if classname != module and not classname.startswith(module + "."):
             return {}
-        qualifier = classname[len(module):].lstrip(".")
+        qualifier = classname[len(module) :].lstrip(".")
         test_id = f"{qualifier}.{name}" if qualifier else name
         if test_id in results:
             return {}
@@ -520,8 +520,7 @@ def _r2e_reward(row: dict[str, Any], report: str) -> float:
     parsed = _parse_junit_xml(report)
     expected = json.loads(row["expected_output_json"])
     expected = {
-        re.sub(r"\x1b\[[0-9;]*m", "", key).split(" - ", 1)[0]: value
-        for key, value in sorted(expected.items())
+        re.sub(r"\x1b\[[0-9;]*m", "", key).split(" - ", 1)[0]: value for key, value in sorted(expected.items())
     }
     return 1.0 if parsed and parsed == expected else 0.0
 
@@ -787,9 +786,7 @@ class MyAgent(DefaultAgent):
                         f'--junitxml={R2E_XML_PATH} -o junit_family=xunit1" '
                         f"{self.reward_command}"
                     )
-                reward_result = self.env.execute(
-                    {"command": reward_command}, timeout=SETUP_AND_REWARD_TIMEOUT_SECONDS
-                )
+                reward_result = self.env.execute({"command": reward_command}, timeout=SETUP_AND_REWARD_TIMEOUT_SECONDS)
                 if reward_result.get("exception_info"):
                     raise RuntimeError(_format_command_result("reward", reward_result))
 
