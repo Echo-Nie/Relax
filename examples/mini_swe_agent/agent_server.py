@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 INSTANCE_PREFIX = "mswe-"
 SETUP_AND_REWARD_TIMEOUT_SECONDS = 300
 R2E_XML_PATH = "/tmp/r2e-reward.xml"
+R2E_JSON_PATH = "/tmp/r2e-reward.json"
 CHILD_KILL_WAIT_TIMEOUT_SECONDS = 5
 
 
@@ -517,12 +518,18 @@ def _format_command_result(label: str, result: dict[str, Any]) -> str:
 
 
 def _r2e_reward(row: dict[str, Any], report: str) -> float:
-    parsed = _parse_junit_xml(report)
+    if report.startswith("{"):
+        try:
+            parsed = json.loads(report)
+        except json.JSONDecodeError:
+            parsed = {}
+    else:
+        parsed = _parse_junit_xml(report)
     expected = json.loads(row["expected_output_json"])
     expected = {
         re.sub(r"\x1b\[[0-9;]*m", "", key).split(" - ", 1)[0]: value for key, value in sorted(expected.items())
     }
-    return 1.0 if parsed and parsed == expected else 0.0
+    return 1.0 if isinstance(parsed, dict) and parsed and "" not in parsed and parsed == expected else 0.0
 
 
 def make_test_spec_without_deps(row: dict[str, Any]) -> "TestSpec":
@@ -781,7 +788,9 @@ class MyAgent(DefaultAgent):
                 reward_command = self.reward_command
                 if self.rollout_mode == "train":
                     reward_command = (
-                        f"rm -f {R2E_XML_PATH} && "
+                        f"rm -f {R2E_XML_PATH} {R2E_JSON_PATH} && "
+                        "python /r2e_unittest_adapter.py && "
+                        f"R2E_RESULTS_JSON={R2E_JSON_PATH} "
                         f'PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}'
                         f'--junitxml={R2E_XML_PATH} -o junit_family=xunit1" '
                         f"{self.reward_command}"
@@ -792,12 +801,16 @@ class MyAgent(DefaultAgent):
 
                 if self.rollout_mode == "train":
                     xml_result = self.env.execute(
-                        {"command": f"cat {R2E_XML_PATH}"}, timeout=SETUP_AND_REWARD_TIMEOUT_SECONDS
+                        {
+                            "command": f"if test -f {R2E_JSON_PATH}; then cat {R2E_JSON_PATH}; "
+                            f"else cat {R2E_XML_PATH}; fi"
+                        },
+                        timeout=SETUP_AND_REWARD_TIMEOUT_SECONDS,
                     )
                     if xml_result.get("exception_info"):
                         raise RuntimeError(_format_command_result("reward XML", xml_result))
                     xml_output = xml_result.get("output", "")
-                    start = xml_output.find("<?xml")
+                    start = xml_output.find("<?xml") if "<?xml" in xml_output else xml_output.find("{")
                     report = xml_output[start:] if xml_result.get("returncode") == 0 and start >= 0 else ""
                     reward = _r2e_reward(self.row, report)
                 else:
@@ -1052,6 +1065,9 @@ class AgentServer:
             environment.setdefault("exec_args", []).extend(
                 ["--bind", f"{self.wheel_dir}:{self.r2e_config['wheel_mount']}:ro"]
             )
+            if record.mode == "train":
+                adapter = Path(__file__).resolve().with_name("r2e_unittest_adapter.py")
+                environment["exec_args"].extend(["--bind", f"{adapter}:/r2e_unittest_adapter.py:ro"])
             environment.pop("environment_class", None)
             model = MyLitellmModel(**config["model"])
             env = ApptainerInstanceEnvironment(tmp_dir=tmp_dir, instance_name=instance_name, **config["environment"])

@@ -127,3 +127,98 @@ def test_real_pytest_junit_xml(tmp_path):
     assert parse_xml(xml) == expected
     assert score(expected, xml) == 1.0
     assert score({**expected, "test_fail": "PASSED"}, xml) == 0.0
+
+
+@pytest.mark.parametrize(
+    "expected, result_json, wanted",
+    [
+        ({"TestPillow.test_ok": "PASSED"}, '{"TestPillow.test_ok": "PASSED"}', 1.0),
+        ({"TestPillow.test_ok": "FAILED"}, '{"TestPillow.test_ok": "FAILED"}', 1.0),
+        ({"TestTornado.test_ws": "ERROR"}, '{"TestTornado.test_ws": "ERROR"}', 1.0),
+        ({"TestPillow.test_ok": "PASSED"}, '{"TestPillow.test_ok": "FAILED"}', 0.0),
+        ({"TestPillow.test_ok": "PASSED"}, "{}", 0.0),
+        ({"TestPillow.test_ok": "PASSED"}, "{invalid", 0.0),
+        ({"": "PASSED"}, '{"": "PASSED"}', 0.0),
+    ],
+)
+def test_unittest_json_reward(expected, result_json, wanted):
+    assert score(expected, result_json) == wanted
+
+
+@pytest.mark.parametrize("filename", ["unittest_custom_runner.py", "tornado_unittest_runner.py"])
+def test_r2e_unittest_runner_json_export(tmp_path, filename):
+    import textwrap
+
+    runner = tmp_path / filename
+    runner.write_text(
+        textwrap.dedent(
+            """\
+            import os
+            import sys
+            import unittest
+
+            class Result(unittest.TestResult):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.results = []
+
+                def _record(self, test, status, detail):
+                    self.results.append((f"sample::{test.__class__.__name__}::{test._testMethodName}", status, detail))
+
+                def addSuccess(self, test):
+                    super().addSuccess(test)
+                    self._record(test, "passed", None)
+
+                def addFailure(self, test, err):
+                    super().addFailure(test, err)
+                    self._record(test, "failed", err)
+
+                def addError(self, test, err):
+                    super().addError(test, err)
+                    self._record(test, "error", err)
+
+                def addSkip(self, test, reason):
+                    super().addSkip(test, reason)
+                    self._record(test, "skipped", reason)
+
+            class Sample(unittest.TestCase):
+                def test_ok(self):
+                    self.assertTrue(True)
+
+                def test_fail(self):
+                    self.assertEqual("PASSED", "FAILED")
+
+                def test_error(self):
+                    raise RuntimeError("PASSED")
+
+                @unittest.skip("FAILED import")
+                def test_skip(self):
+                    pass
+
+            def main():
+                suite = unittest.defaultTestLoader.loadTestsFromTestCase(Sample)
+                runner = unittest.TextTestRunner(resultclass=Result)
+                result = runner.run(suite)
+                sys.exit(not result.wasSuccessful())
+
+            if __name__ == "__main__":
+                main()
+            """
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run([sys.executable, str(SOURCE.parent / "r2e_unittest_adapter.py"), str(tmp_path)], check=True)
+
+    result_path = tmp_path / "results.json"
+    env = os.environ.copy()
+    env["R2E_RESULTS_JSON"] = str(result_path)
+    run = subprocess.run([sys.executable, str(runner)], env=env, capture_output=True, text=True)
+    assert run.returncode == 1, run.stdout + run.stderr
+    results = json.loads(result_path.read_text(encoding="utf-8"))
+    assert results == {
+        "Sample.test_error": "ERROR",
+        "Sample.test_fail": "FAILED",
+        "Sample.test_ok": "PASSED",
+    }
+    assert score(results, result_path.read_text(encoding="utf-8")) == 1.0
+    assert score({**results, "Sample.test_fail": "PASSED"}, result_path.read_text(encoding="utf-8")) == 0.0
