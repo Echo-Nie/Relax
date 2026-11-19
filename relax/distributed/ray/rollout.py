@@ -100,23 +100,33 @@ class EngineGroupConfig:
     """Configuration for a single engine group.
 
     Attributes:
-        worker_type: One of "regular", "prefill", "decode", or "placeholder".
-                     "placeholder" reserves GPU slots without creating engines.
+        worker_type: One of "regular", "prefill", "decode", "encoder", or
+                     "placeholder".  "placeholder" reserves GPU slots without
+                     creating engines.  "encoder" runs an SGLang
+                     ``--encoder-only`` server (vision tower only); its
+                     consumers are started with ``language_only=True``.
         num_gpus: Total number of GPUs for this group.
         num_gpus_per_engine: GPUs per engine for this group.  Overrides the
                              model-level or global ``--rollout-num-gpus-per-engine``.
         overrides: Optional dict of SGLang ``ServerArgs`` field overrides.
                    These are applied on top of the base CLI ``--sglang-*``
                    arguments in ``_compute_server_args``.
+        env: Optional per-group environment variables for the engine Ray
+             actors.  Needed because some SGLang env vars are name-shared but
+             semantically different per worker type -- notably
+             ``SGLANG_VLM_CACHE_SIZE_MB``, which caches CPU tensors on an
+             encoder server but *GPU* tensors everywhere else, so it cannot be
+             raised globally without starving the colocated actor.
     """
 
     worker_type: str
     num_gpus: int
     num_gpus_per_engine: int | None = None
     overrides: dict = dataclasses.field(default_factory=dict)
+    env: dict = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
-        valid_types = {"regular", "prefill", "decode", "placeholder"}
+        valid_types = {"regular", "prefill", "decode", "encoder", "placeholder"}
         assert self.worker_type in valid_types, (
             f"Invalid worker_type '{self.worker_type}', must be one of {valid_types}"
         )
@@ -158,6 +168,23 @@ class ModelConfig:
     @property
     def has_pd_disaggregation(self) -> bool:
         return any(g.worker_type in ("prefill", "decode") for g in self.engine_groups)
+
+    @property
+    def has_encoder_disaggregation(self) -> bool:
+        return any(g.worker_type == "encoder" for g in self.engine_groups)
+
+    @property
+    def encoder_groups(self) -> list[EngineGroupConfig]:
+        return [g for g in self.engine_groups if g.worker_type == "encoder"]
+
+    @property
+    def encoder_consumer_groups(self) -> list[EngineGroupConfig]:
+        """Groups that consume encoder embeddings, i.e. run ``language_only``.
+
+        ``decode`` is excluded: in a full E+P+D split it receives KV from
+        prefill and never touches multimodal input.
+        """
+        return [g for g in self.engine_groups if g.worker_type in ("regular", "prefill")]
 
     @property
     def total_num_gpus(self) -> int:
@@ -241,6 +268,10 @@ class SglangConfig:
     @property
     def has_pd_disaggregation(self) -> bool:
         return any(m.has_pd_disaggregation for m in self.models)
+
+    @property
+    def has_encoder_disaggregation(self) -> bool:
+        return any(m.has_encoder_disaggregation for m in self.models)
 
     @property
     def total_num_gpus(self) -> int:
@@ -360,10 +391,11 @@ class EngineGroup:
     all_engines: list
     num_gpus_per_engine: int
     num_new_engines: int
-    worker_type: str = "regular"  # "regular", "prefill", or "decode"
+    worker_type: str = "regular"  # "regular", "prefill", "decode", or "encoder"
     rank_offset: int = 0  # cumulative engine count before this group
     gpu_offset: int = 0  # cumulative GPU count before this group
     sglang_overrides: dict = dataclasses.field(default_factory=dict)
+    group_env: dict = dataclasses.field(default_factory=dict)
     router_ip: str | None = None
     router_port: int | None = None
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
@@ -483,6 +515,9 @@ class EngineGroup:
             )
             if getattr(self.args, "fp16", False):
                 env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
+            # Per-group env wins over the shared defaults above.  See
+            # EngineGroupConfig.env for why this cannot be a global export.
+            env_vars.update({k: str(v) for k, v in self.group_env.items()})
 
             accelerator_kwargs = get_ray_accelerator_kwargs(num_gpus)
             rollout_engine = RolloutRayActor.options(
@@ -525,6 +560,9 @@ class EngineGroup:
                 num_gpus_per_engine=self.num_gpus_per_engine,
                 rank_offset=self.rank_offset,
                 base_port=base_port,
+                # EPD consumers each run their own EncoderBootstrapServer; without
+                # a distinct port they fight over SGLang's fixed 8997 default.
+                alloc_encoder_bootstrap_port=bool(self.sglang_overrides.get("language_only")),
             )
 
         init_handles = []
@@ -560,14 +598,32 @@ class EngineGroup:
         """Fire release_memory_occupation on all engines (non-blocking).
 
         Returns a list of Ray ObjectRefs.
+
+        Encoder groups get a different call.  SGLang's ``--encoder-only``
+        server has no memory-saver integration and exposes no
+        ``/release_memory_occupation``, so the vision tower itself stays
+        resident for the process lifetime -- which is exactly what makes
+        cross-step encoder prefetch possible, the encoder being the one engine
+        still alive while the actor trains.  Its embedding cache is a different
+        matter: on the mooncake transport that cache is GPU-resident and sized
+        in GiB, and it is untouched for the whole training phase, so it is
+        spilled to host RAM instead.  Spill, not clear -- see
+        :meth:`SGLangEngine.spill_mm_cache`.
         """
+        if self.worker_type == "encoder":
+            return [engine.spill_mm_cache.remote() for engine in self.engines if engine is not None]
         return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
 
     def onload(self, tags: list[str] | None = None):
         """Fire resume_memory_occupation on all engines (non-blocking).
 
-        Returns a list of Ray ObjectRefs.
+        Returns a list of Ray ObjectRefs.  Encoder groups page their embedding
+        cache back onto the GPU instead, mirroring :meth:`offload`.  A partial
+        (tag-scoped) resume is a weights/KV-cache staging concept that has no
+        encoder analogue, so the cache comes back on any onload.
         """
+        if self.worker_type == "encoder":
+            return [engine.restore_mm_cache.remote() for engine in self.engines if engine is not None]
         return [engine.resume_memory_occupation.remote(tags=tags) for engine in self.engines if engine is not None]
 
     def healthcheck_engines(self, timeout: float = 5.0) -> set[int]:
@@ -653,10 +709,29 @@ class RolloutServer:
     model_name: str = "default"
 
     @property
+    def serving_engine_groups(self) -> list[EngineGroup]:
+        """Groups that serve routed traffic and take part in weight sync.
+
+        Encoder groups are excluded.  An ``--encoder-only`` server holds only
+        the vision tower and exposes neither ``/update_weights_from_*`` nor
+        ``/pause_generation``; since the weight-sync process group sizes itself
+        as a flat ``1 + sum(engine_gpu_counts)`` and every bucket is a
+        collective broadcast, a member that cannot participate deadlocks all
+        the others.  Encoder weights come from the checkpoint at load time and
+        never change -- EPD requires ``--freeze-vision-model``.
+        """
+        return [g for g in self.engine_groups if g.worker_type != "encoder"]
+
+    @property
     def engines(self):
-        """All node-0 engines across all groups (placeholder groups contribute
-        nothing)."""
-        return [e for g in self.engine_groups for e in g.engines]
+        """All node-0 serving engines across all groups (placeholder groups
+        contribute nothing; encoder groups are excluded)."""
+        return [e for g in self.serving_engine_groups for e in g.engines]
+
+    @property
+    def encoder_engines(self):
+        """Node-0 engines of the encoder groups, if any."""
+        return [e for g in self.engine_groups if g.worker_type == "encoder" for e in g.engines]
 
     @property
     def all_engines(self):
@@ -676,7 +751,7 @@ class RolloutServer:
     def engine_gpu_counts(self) -> list[int]:
         """Per-engine GPU count for all node-0 engines, parallel to
         ``engines``."""
-        return [g.num_gpus_per_engine for g in self.engine_groups for _ in g.engines]
+        return [g.num_gpus_per_engine for g in self.serving_engine_groups for _ in g.engines]
 
     @property
     def engine_gpu_offsets(self) -> list[int]:
@@ -687,7 +762,7 @@ class RolloutServer:
         engines.
         """
         offsets = []
-        for g in self.engine_groups:
+        for g in self.serving_engine_groups:
             for j in range(len(g.engines)):
                 offsets.append(g.gpu_offset + j * g.num_gpus_per_engine)
         return offsets
@@ -696,9 +771,9 @@ class RolloutServer:
     def nodes_per_engine(self):
         """Nodes per engine.
 
-        Only valid when all active groups share the same value.
+        Only valid when all active serving groups share the same value.
         """
-        values = {g.nodes_per_engine for g in self.engine_groups}
+        values = {g.nodes_per_engine for g in self.serving_engine_groups}
         if len(values) != 1:
             raise ValueError(f"Heterogeneous nodes_per_engine across groups: {values}")
         return values.pop()
@@ -838,6 +913,9 @@ class RolloutServer:
                 continue
             logger.info(f"Recovered {g.num_new_engines} dead rollout engines (worker_type={g.worker_type})")
             assert g.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
+            if g.worker_type == "encoder":
+                # No memory-saver on an --encoder-only server; see EngineGroup.offload.
+                continue
             if g.args.offload_rollout and dead_indices:
                 new_engines = [g.all_engines[i] for i in dead_indices]
                 release_handles.extend(engine.release_memory_occupation.remote() for engine in new_engines)
@@ -4860,7 +4938,18 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     num_gpus_per_engine=None,
     rank_offset=0,
     base_port=15000,
+    alloc_encoder_bootstrap_port=False,
 ):
+    # get ports
+    # there are 5 ports we need to allocate
+    # 1. server port
+    # 2. nccl port
+    # 3. dist_init_addr port
+    # 4. other ports for dp_attention, which is of size 4 + dp_size
+    # 5. encoder bootstrap port, for language_only (EPD consumer) engines only.
+    #    SGLang defaults it to a FIXED 8997 and starts an EncoderBootstrapServer
+    #    on it inside every language_only tokenizer manager, so two consumers on
+    #    one node collide with "[Errno 98] address already in use".
     gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nodes_per_engine = max(1, gpus_per_engine // args.num_gpus_per_node)
     addr_and_ports: dict[int, dict] = {}
@@ -4897,6 +4986,8 @@ def _allocate_rollout_engine_addr_and_ports_normal(
         ports = dict(host=host, port=allocate_port(engine, host), nccl_port=allocate_port(engine, host))
         if worker_type == "prefill":
             ports["disaggregation_bootstrap_port"] = allocate_port(engine, host)
+        if alloc_encoder_bootstrap_port:
+            ports["encoder_bootstrap_port"] = allocate_port(engine, host)
 
         # Only the distributed rendezvous belongs to the TP group's head.
         head_rank = rank - (rank - rank_offset) % nodes_per_engine
@@ -5320,27 +5411,78 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
         engine_groups: list[EngineGroup] = []
         all_init_handles: list = []
         port_cursors: dict[str, int] = {}
+        encoder_urls: list[str] = []
 
-        for group_cfg in model_cfg.engine_groups:
+        def _make_group(group_cfg, extra_overrides: dict | None = None) -> tuple[EngineGroup, int]:
+            """Build one EngineGroup at the current offsets; returns (group,
+            num_engines).
+
+            Reads ``engine_offset`` / ``gpu_offset`` from the enclosing scope,
+            so it must be called before the caller advances them for the next
+            group.
+            """
+            is_encoder = group_cfg.worker_type == "encoder"
             gpus_per_engine = group_cfg.num_gpus_per_engine
             num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
             num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
-
-            group = EngineGroup(
-                args=args,
-                pg=pg,
-                all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
-                num_gpus_per_engine=gpus_per_engine,
-                num_new_engines=0,
-                worker_type=group_cfg.worker_type,
-                rank_offset=engine_offset,
-                gpu_offset=gpu_offset,
-                sglang_overrides=group_cfg.overrides,
-                router_ip=router_ip,
-                router_port=router_port,
-                skip_router_registration=defer_router,
-                require_router_registration=defer_router,
+            overrides = dict(group_cfg.overrides)
+            if extra_overrides:
+                overrides.update(extra_overrides)
+            return (
+                EngineGroup(
+                    args=args,
+                    pg=pg,
+                    all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
+                    num_gpus_per_engine=gpus_per_engine,
+                    num_new_engines=0,
+                    worker_type=group_cfg.worker_type,
+                    rank_offset=engine_offset,
+                    gpu_offset=gpu_offset,
+                    sglang_overrides=overrides,
+                    group_env=group_cfg.env,
+                    # An encoder serves no /generate traffic, so it must stay out
+                    # of the router's worker registry; and it has no
+                    # /update_weights_from_* route, so it must stay out of the
+                    # weight-sync NCCL group (whose world_size is a flat sum over
+                    # members -- a non-participating member deadlocks the rest).
+                    router_ip=None if is_encoder else router_ip,
+                    router_port=None if is_encoder else router_port,
+                    skip_dcs_registration=is_encoder,
+                    skip_router_registration=True if is_encoder else defer_router,
+                    require_router_registration=False if is_encoder else defer_router,
+                ),
+                num_engines,
             )
+
+        # Phase 1: encoder groups must be up *before* their consumers, because
+        # their URLs go into the consumers' server args.  This phase is
+        # synchronous even though the rest of engine init is deferred.
+        if model_cfg.has_encoder_disaggregation:
+            for group_cfg in model_cfg.encoder_groups:
+                group, num_engines = _make_group(group_cfg)
+                handles, port_cursors = group.start_engines(port_cursors)
+                if handles:
+                    ray.get(handles)
+                encoder_urls.extend(u for u in ray.get([e.get_url.remote() for e in group.engines]) if u is not None)
+                started_groups.append(group)
+                engine_groups.append(group)
+                engine_offset += num_engines
+                gpu_offset += group_cfg.num_gpus
+            logger.info(f"EPD phase 1 done for model '{model_cfg.name}': encoder endpoints {encoder_urls}")
+            # Publish for the rollout worker (cross-step encoder prefetch reads
+            # these), the same way the router ip/port are written back above.
+            if model_idx == 0:
+                args.rollout_encoder_urls = list(encoder_urls)
+
+        # Phase 2: everything else, with the encoder URLs injected into the
+        # multimodal consumers (decode never touches multimodal input).
+        for group_cfg in model_cfg.engine_groups:
+            if group_cfg.worker_type == "encoder":
+                continue
+            extra_overrides = None
+            if encoder_urls and group_cfg.worker_type in ("regular", "prefill"):
+                extra_overrides = {"language_only": True, "encoder_urls": list(encoder_urls)}
+            group, num_engines = _make_group(group_cfg, extra_overrides)
             started_groups.append(group)
             handles, port_cursors = group.start_engines(port_cursors)
             all_init_handles.extend(handles)
