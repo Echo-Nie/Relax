@@ -28,6 +28,7 @@ from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
+from relax.engine.rollout.encoder_prefetch import EncoderPrefetcher, is_encoder_prefetch_enabled
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
@@ -82,6 +83,43 @@ logger = get_logger(__name__)
 # deadlocking on the same non-reentrant semaphore. A ContextVar is task-local
 # and propagates down the await chain (including create_task children).
 _holding_session_lock: contextvars.ContextVar[bool] = contextvars.ContextVar("holding_session_lock", default=False)
+
+
+def _can_prefetch_encoder_early(args) -> bool:
+    """Whether the next step's batch may be drawn during this step's rollout.
+
+    ``generate_rollout`` returns this step's aborted samples to the buffer
+    *before* drawing the next batch, so the next step can pick them up.  Drawing
+    early would skip them and silently change the data order, so any config that
+    can abort keeps the original late placement.
+    """
+    if getattr(args, "partial_rollout", False):
+        return False
+    if getattr(args, "dynamic_sampling_filter_path", None):
+        return False
+    return True
+
+
+def _maybe_start_encoder_prefetch(args, state, data_source, rollout_id) -> None:
+    """Draw the next step's batch now and warm the encoder with its images.
+
+    No-op unless an encoder group is deployed.  Never raises: the prefetch only
+    warms a cache, so a failure costs performance and nothing else.
+    """
+    try:
+        if state.next_samples_ref is not None:
+            return  # already started for this step
+        if args.fully_async:
+            return
+        if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+            return
+        if not is_encoder_prefetch_enabled(args) or not _can_prefetch_encoder_early(args):
+            return
+        state.next_samples_ref = data_source.get_samples.remote(args.over_sampling_batch_size)
+        state.encoder_prefetcher.submit(state.next_samples_ref)
+        logger.info(f"Rollout step {rollout_id}: early encoder prefetch for the next step started")
+    except Exception as e:
+        logger.warning(f"Early encoder prefetch could not start: {e!r}")
 
 
 def _ensure_not_holding_session_lock() -> None:
@@ -157,6 +195,10 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_rank = 0
 
         self.partial_genrm = PartialGenRM.from_args(args, self)
+        # Cross-step encoder prefetch (encoder-disaggregated deployments only).
+        # Inert when no encoder group is configured.
+        self.encoder_prefetcher = EncoderPrefetcher(args)
+
         self.reset()
 
     @contextmanager
@@ -208,6 +250,12 @@ class GenerateState(metaclass=SingletonMeta):
         # step N is consumed at the beginning of step N+1.
         if not hasattr(self, "prefetched_samples_ref"):
             self.prefetched_samples_ref: ray.ObjectRef | None = None
+        # Ref drawn early (mid-rollout) so the encoder can prefetch the next
+        # step's images while it still owns its GPU.  Kept separate from
+        # prefetched_samples_ref on purpose: the submit loop consumes that one,
+        # and would otherwise eat the next step's batch as its own.
+        if not hasattr(self, "next_samples_ref"):
+            self.next_samples_ref: ray.ObjectRef | None = None
         # How many groups the previous step left short of its transfer-queue target
         # (rollout_batch_size - committed_current). The next step backfills exactly this
         # many into rollout_id-1. Persisted across reset() like prefetched_samples_ref;
@@ -1081,6 +1129,20 @@ async def _generate_rollout_async(
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
+            # Kick the next step's encoder prefetch now that this step's own
+            # work is queued, rather than after generate_rollout returns.
+            #
+            # The encoder's share of a step is front-loaded: it encodes this
+            # step's images during the prefill wave and is then idle through
+            # generation and the whole teacher tail. During the rollout phase it
+            # also owns its GPU outright, whereas the training phase shares that
+            # GPU with actor TP rank 0 -- and because the actor is a synchronous
+            # TP collective, stealing from rank 0 stalls every rank. So the
+            # rollout phase is strictly the better window.
+            #
+            # The encoder queue is FIFO and this step's requests are already
+            # ahead of it, so the prefetch cannot jump the critical path.
+            _maybe_start_encoder_prefetch(args, state, data_source, rollout_id)
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
         done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -1607,6 +1669,18 @@ def generate_rollout(
     )
     if not args.fully_async and not _lora_adapter_mode and not _save_data:
         state = GenerateState(args)
-        state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
-        logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
+        if state.next_samples_ref is not None:
+            # _maybe_start_encoder_prefetch already drew this batch mid-rollout
+            # and handed it to the encoder; just promote it, do not draw twice.
+            state.prefetched_samples_ref = state.next_samples_ref
+            state.next_samples_ref = None
+            logger.info(f"Rollout step {rollout_id}: reusing the early next-step fetch")
+        else:
+            state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
+            logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
+            # Encoder disaggregation only, and only for configs that could not
+            # take the early path (see _can_prefetch_encoder_early): warm the
+            # encoder now. Warms a cache and nothing else -- on failure the ViT
+            # just runs inline as it does today.
+            state.encoder_prefetcher.submit(state.prefetched_samples_ref)
     return output

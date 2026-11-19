@@ -275,6 +275,13 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_SFT_MTP_ACCEPTANCE_METRICS = EnvProperty("RELAX_SFT_MTP_ACCEPTANCE_METRICS", bool, True)
     RELAX_SFT_PRE_SHIFTED_LABELS = EnvProperty("RELAX_SFT_PRE_SHIFTED_LABELS", bool, False)
     RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS = EnvProperty("RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS", bool, False)
+    # ------------- Encoder disaggregation (EPD) -------------
+    # Cross-step encoder prefetch: warm the encoder's embedding cache with step
+    # N+1's images while step N is still generating and the actor trains.  Inert
+    # unless an encoder group is deployed; set to 0 for an A/B against plain EPD.
+    RELAX_ENCODER_PREFETCH = EnvProperty("RELAX_ENCODER_PREFETCH", bool, True)
+    RELAX_ENCODER_PREFETCH_CONCURRENCY = EnvProperty("RELAX_ENCODER_PREFETCH_CONCURRENCY", int, 8)
+    RELAX_ENCODER_PREFETCH_TIMEOUT_S = EnvProperty("RELAX_ENCODER_PREFETCH_TIMEOUT_S", int, 600)
 
     # ------------- Telemetry / Log -------------
     RELAX_TELEMETRY_HOOK = EnvProperty("RELAX_TELEMETRY_HOOK", str, None)

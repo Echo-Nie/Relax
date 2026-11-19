@@ -1906,3 +1906,577 @@ index fed78cf..99b3bd4 100644
              q, k, v, gate = self.forward_prepare_fused_gate(
                  positions=positions,
                  hidden_states=hidden_states,
+diff --git a/python/sglang/srt/disaggregation/encode_receiver.py b/python/sglang/srt/disaggregation/encode_receiver.py
+index bbe120c..6fa5459 100644
+--- a/python/sglang/srt/disaggregation/encode_receiver.py
++++ b/python/sglang/srt/disaggregation/encode_receiver.py
+@@ -271,6 +271,21 @@ def _grpc_target(url: str) -> str:
+     return url
+ 
+ 
++def _prompt_for_mm_rebuild(recv_req):
++    """Prompt to hand to ``get_mm_data`` when rebuilding mm inputs.
++
++    Requests submitted as pre-tokenized ``input_ids`` carry no ``input_text``.
++    Passing that None through reaches ``tokenizer.encode(None)`` and raises
++    "text input must be of type `str`", which kills the scheduler process and
++    takes the whole server down with it.  Mirror what the non-EPD path does in
++    tokenizer_manager (``input_text or input_ids``): ``build_input_ids``
++    already accepts a token-id list.
++    """
++    if recv_req.input_text is not None:
++        return recv_req.input_text
++    return list(recv_req.input_ids)
++
++
+ def _normalize_embedding_ports(embedding_port):
+     if embedding_port is None:
+         return []
+@@ -821,7 +836,7 @@ class WaitingImageRequest:
+ 
+         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+         mm_inputs = self.mm_processor.get_mm_data(
+-            self.recv_req.input_text,
++            _prompt_for_mm_rebuild(self.recv_req),
+             recv_embedding,
+             **self.recv_embedding_data.get_mm_extra_meta(),
+         )
+@@ -1165,7 +1180,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
+         else:
+             recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+         mm_inputs = self.mm_processor.get_mm_data(
+-            self.recv_req.input_text,
++            _prompt_for_mm_rebuild(self.recv_req),
+             recv_embedding,
+             **self.recv_embedding_data.get_mm_extra_meta(),
+         )
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+index cc2b100..d8bc4b1 100644
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -292,6 +292,86 @@ class BaseMultimodalProcessor(ABC):
+     def spatial_merge_size(self):
+         return self.hf_config.vision_config.spatial_merge_size
+ 
++    @staticmethod
++    def _expanded_mm_offsets(prompt, token_id, per_item_counts):
++        """Locate already-expanded placeholder runs for one modality.
++
++        Returns a list of inclusive ``(start, end)`` spans, one per item, or
++        ``None`` when the prompt does not match *per_item_counts* (i.e. it is
++        not expanded, or is expanded inconsistently).  Consecutive items whose
++        runs are adjacent are split by their expected lengths.
++        """
++        if token_id is None or not per_item_counts:
++            return []
++        spans = []
++        i = 0
++        n = len(prompt)
++        item = 0
++        while i < n:
++            if prompt[i] != token_id:
++                i += 1
++                continue
++            run_start = i
++            while i < n and prompt[i] == token_id:
++                i += 1
++            pos, remaining = run_start, i - run_start
++            while remaining > 0:
++                if item >= len(per_item_counts):
++                    return None
++                take = per_item_counts[item]
++                if take > remaining:
++                    return None
++                spans.append((pos, pos + take - 1))
++                pos += take
++                remaining -= take
++                item += 1
++        return spans if item == len(per_item_counts) else None
++
++    def _try_build_expanded_input_ids(
++        self, prompt, img_counts, video_counts, audio_counts
++    ):
++        """Handle prompts whose placeholders are already expanded.
++
++        The normal path below turns ONE placeholder token per item into
++        ``mm_token_num`` copies.  Callers that supply their own tokenized,
++        already-expanded ``input_ids`` -- an RL trainer, for instance, which
++        must keep rollout and training token sequences identical -- would get
++        those runs expanded a second time.  Detect that case by comparing the
++        placeholder count already present against the count the grids imply,
++        and if they match, keep the prompt verbatim and only derive offsets.
++
++        Returns ``(input_ids, offsets, modality_list)`` or ``None`` when the
++        prompt is not already expanded, in which case the caller falls through
++        to the normal expanding path.
++        """
++        token_ids = {
++            Modality.IMAGE: (getattr(self, "IM_TOKEN_ID", None), img_counts),
++            Modality.VIDEO: (getattr(self, "VIDEO_TOKEN_ID", None), video_counts),
++            Modality.AUDIO: (getattr(self, "audio_token_id", None), audio_counts),
++        }
++
++        expected_total = sum(sum(counts) for _, counts in token_ids.values())
++        present_total = sum(
++            sum(1 for tok in prompt if tok == tid)
++            for tid, counts in token_ids.values()
++            if tid is not None and counts
++        )
++        num_items = sum(len(counts) for _, counts in token_ids.values())
++        # Ambiguous when every item expands to exactly one token; prefer the
++        # historical expanding path so existing callers are unaffected.
++        if expected_total == 0 or present_total != expected_total or num_items == expected_total:
++            return None
++
++        placed = []
++        for modality, (tid, counts) in token_ids.items():
++            spans = self._expanded_mm_offsets(prompt, tid, counts)
++            if spans is None:
++                return None
++            placed.extend((span, modality) for span in spans)
++
++        placed.sort(key=lambda item: item[0][0])
++        return list(prompt), [span for span, _ in placed], [m for _, m in placed]
++
+     def build_input_ids(
+         self, prompt, img_grid_thw=None, video_grid_thw=None, audio_seq_lens=None
+     ):
+@@ -307,6 +387,15 @@ class BaseMultimodalProcessor(ABC):
+         audio_token_id = getattr(self, "audio_token_id", None)
+         spatial_merge_size = getattr(self, "spatial_merge_size", 1)
+ 
++        already_expanded = self._try_build_expanded_input_ids(
++            prompt,
++            [int(g.prod()) // (spatial_merge_size**2) for g in (img_grid_thw if img_grid_thw is not None else [])],
++            [int(g.prod()) // (spatial_merge_size**2) for g in (video_grid_thw if video_grid_thw is not None else [])],
++            [int(x) for x in (audio_seq_lens if audio_seq_lens is not None else [])],
++        )
++        if already_expanded is not None:
++            return already_expanded
++
+         input_ids = []
+         offsets = []
+ 
+diff --git a/python/sglang/srt/disaggregation/encode_server.py b/python/sglang/srt/disaggregation/encode_server.py
+index a3bd73a..68ab868 100644
+--- a/python/sglang/srt/disaggregation/encode_server.py
++++ b/python/sglang/srt/disaggregation/encode_server.py
+@@ -90,6 +90,12 @@ logger = logging.getLogger(__name__)
+ 
+ HEALTH_CHECK_TIMEOUT = 30
+ 
++# How long /spill_mm_cache waits for in-flight VIT forwards before giving up on
++# them and spilling whatever is not pinned. Short on purpose: the caller is the
++# rollout->train transition, so every second here delays training. Stragglers
++# keep their cache entry on the GPU and are collected by the next spill.
++SPILL_DRAIN_TIMEOUT = float(os.environ.get("SGLANG_ENCODER_SPILL_DRAIN_TIMEOUT", "10"))
++
+ 
+ def is_health_check_request(rid: Optional[str]) -> bool:
+     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+@@ -330,6 +336,9 @@ class MMEncoder:
+         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
+         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
+         self.mm_cache_lock = asyncio.Lock()
++        # /spill_mm_cache state. Only meaningful on the mooncake transport,
++        # where cached embeddings stay on the device; see spill_mm_cache().
++        self._mm_cache_spilled = False
+ 
+         self.io_executor = concurrent.futures.ThreadPoolExecutor(
+             max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
+@@ -345,6 +354,8 @@ class MMEncoder:
+         # Embedding dtype = model param dtype. Always available (both transfer
+         # backends and the global-cache pool rely on it).
+         self._embedding_dtype = next(self.model.parameters()).dtype
++        # Where cached embeddings live when not spilled; see spill_mm_cache().
++        self._mm_cache_device = next(self.model.parameters()).device
+         self._element_size = torch.tensor(
+             [], dtype=self._embedding_dtype
+         ).element_size()
+@@ -2041,6 +2052,169 @@ class MMEncoder:
+         self.background_tasks.add(task)
+         task.add_done_callback(self.background_tasks.discard)
+ 
++    async def _drain_inflight_encode_state(self, timeout: float) -> Tuple[int, int]:
++        """Run the delayed cleanup early for every *finished* request.
++
++        Returns ``(drained, still_running)``.
++
++        A finished request keeps pinning its embedding -- both the tensor, via
++        ``_forward_results[rid]``, and the mooncake memory region registered
++        over it -- until ``send_timeout`` (180s) elapses.  A prefetch is never
++        /send-ed at all, so it always waits out that full timeout.  Without
++        this, a spill right after a rollout would find most of the cache still
++        referenced and free almost nothing.
++
++        Running forwards are left alone, after a bounded wait: popping
++        ``_forward_results[rid]`` under a live ``_run_forward`` makes it
++        KeyError on its own result write and lose the embedding it just
++        computed.  Whatever is still busy at the deadline stays pinned and gets
++        picked up by the next spill.
++
++        Only reachable on rank 0 / mooncake, where this state exists.
++        """
++        if not hasattr(self, "_forward_results"):
++            return 0, 0
++        deadline = time.monotonic() + timeout
++        for event in list(self._forward_ready_events.values()):
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                break
++            try:
++                await asyncio.wait_for(event.wait(), timeout=remaining)
++            except asyncio.TimeoutError:
++                break
++        drained = 0
++        still_running = 0
++        for req_id in list(self._forward_results.keys()):
++            event = self._forward_ready_events.get(req_id)
++            if event is not None and not event.is_set():
++                still_running += 1
++                continue
++            await self._cleanup_inflight_encode_state(req_id)
++            drained += 1
++        return drained, still_running
++
++    @property
++    def _mm_cache_on_device(self) -> bool:
++        """True when cached embeddings are device tensors.
++
++        Only the mooncake path keeps them there; ``_encode`` copies to host
++        before caching, so on every other transport the cache is already in
++        host RAM and spill/restore must stay out of the way -- restoring a
++        zmq cache would *upload* the whole thing to the GPU.
++        """
++        return self.server_args.encoder_transfer_backend == "mooncake"
++
++    async def spill_mm_cache(self) -> dict:
++        """Move GPU-resident cache entries to host RAM and free the VRAM.
++
++        Motivation: in a colocate deployment the encoder shares its GPU with
++        the trainer.  The cache is worth several GiB and goes untouched for the
++        whole training phase, but SGLang has no memory-saver on an
++        ``--encoder-only`` server, so nothing reclaims it.  Spilling to host
++        rather than clearing is what keeps the cross-step prefetch worth
++        anything -- a clear would discard exactly the embeddings the prefetch
++        just paid for.
++        """
++        if not self._mm_cache_on_device:
++            return {
++                "spilled": False,
++                "drained": 0,
++                "moved": 0,
++                "entries": len(self.mm_cache),
++                "moved_bytes": 0,
++            }
++        drained, still_running = await self._drain_inflight_encode_state(
++            SPILL_DRAIN_TIMEOUT
++        )
++        # Anything the drain could not release is still owned by a running
++        # forward, and its mooncake MR is still live: freeing that device
++        # tensor would leave the registration pointing at reclaimed memory.
++        # Leave those few entries on the GPU for the next spill to collect.
++        pinned = {
++            state["embedding"].data_ptr()
++            for state in getattr(self, "_forward_results", {}).values()
++            if state.get("embedding") is not None
++        }
++        moved = 0
++        moved_bytes = 0
++        skipped = 0
++        async with self.mm_cache_lock:
++            for entry in self.mm_cache.mm_cache.values():
++                emb = entry.embedding
++                if not emb.is_cuda:
++                    continue
++                if emb.data_ptr() in pinned:
++                    skipped += 1
++                    continue
++                # pin_memory keeps the copies off the pageable staging path and
++                # lets the restore issue them asynchronously.
++                host = torch.empty(emb.shape, dtype=emb.dtype, pin_memory=True)
++                host.copy_(emb)
++                entry.embedding = host
++                moved += 1
++                moved_bytes += host.element_size() * host.numel()
++            # Flipped inside the lock so a concurrent insert cannot land a
++            # device tensor between the last move and the flag.
++            self._mm_cache_spilled = True
++        if moved:
++            torch.cuda.empty_cache()
++        logger.info(
++            f"spill_mm_cache: drained={drained} still_running={still_running} "
++            f"moved={moved}/{len(self.mm_cache)} entries "
++            f"({moved_bytes / 2**20:.0f} MiB) to host, skipped={skipped} pinned"
++        )
++        return {
++            "spilled": True,
++            "drained": drained,
++            "still_running": still_running,
++            "moved": moved,
++            "skipped": skipped,
++            "entries": len(self.mm_cache),
++            "moved_bytes": moved_bytes,
++        }
++
++    async def restore_mm_cache(self) -> dict:
++        """Move spilled cache entries back onto the GPU.
++
++        Idempotent, and a no-op if nothing was ever spilled.  Kept explicit
++        rather than lazy-on-hit so the H2D copies land before the rollout wave
++        instead of inside it; the hit path in :meth:`encode_with_mooncake`
++        still tolerates a host tensor, so a skipped restore degrades to a
++        slower first hit rather than a wrong answer.
++        """
++        if not self._mm_cache_spilled:
++            return {
++                "spilled": False,
++                "moved": 0,
++                "entries": len(self.mm_cache),
++                "moved_bytes": 0,
++            }
++        device = self._mm_cache_device
++        moved = 0
++        moved_bytes = 0
++        async with self.mm_cache_lock:
++            self._mm_cache_spilled = False
++            for entry in self.mm_cache.mm_cache.values():
++                emb = entry.embedding
++                if emb.is_cuda:
++                    continue
++                entry.embedding = emb.to(device, non_blocking=True)
++                moved += 1
++                moved_bytes += emb.element_size() * emb.numel()
++            if moved:
++                torch.cuda.current_stream(device).synchronize()
++        logger.info(
++            f"restore_mm_cache: moved={moved}/{len(self.mm_cache)} entries "
++            f"({moved_bytes / 2**20:.0f} MiB) back to {device}"
++        )
++        return {
++            "spilled": False,
++            "moved": moved,
++            "entries": len(self.mm_cache),
++            "moved_bytes": moved_bytes,
++        }
++
+     async def encode_with_mooncake(
+         self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+     ):
+@@ -2071,8 +2245,74 @@ class MMEncoder:
+                 val = _convert(v)
+                 mm_item.set(k, val)
+ 
++            # Embedding cache on the mooncake path.  Upstream only wires
++            # self.mm_cache into _encode(), so --enable-prefix-mm-cache used to
++            # be silently inert here -- costly for workloads that repeat an
++            # image set (an RL group's N samples share one), where it is worth
++            # an N-fold cut in vision-tower work.
++            #
++            # Restricted to tp_size == 1 on purpose: the VIT forward is a
++            # collective across encoder TP ranks, so letting one rank skip it on
++            # a cache hit would hang the others.  Making this safe for TP>1
++            # needs the hit/miss decision agreed across ranks first.
++            #
++            # The cached tensor normally stays on the GPU (this path never
++            # copies to host), so a hit is a pure device-to-device RDMA and
++            # SGLANG_VLM_CACHE_SIZE_MB bounds VRAM here rather than host RAM.
++            # spill_mm_cache() temporarily inverts that for the training phase.
++            use_mm_cache = (
++                self.server_args.enable_prefix_mm_cache
++                and self.server_args.tp_size == 1
++                and not is_health_check_request(req_id)
++            )
++            mm_hash = None
++            cached_embedding = None
++            if use_mm_cache:
++                mm_item.set_pad_value()
++                mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
++                async with self.mm_cache_lock:
++                    entry = self.mm_cache.get([mm_item.hash])
++                if entry is not None:
++                    cached_embedding = entry.embedding
++                    if not cached_embedding.is_cuda:
++                        # Spilled (see spill_mm_cache): the transfer needs a
++                        # device buffer.  Stage a transient copy and leave the
++                        # cache on host -- writing it back would silently undo
++                        # the spill one hit at a time.  Still far cheaper than
++                        # re-running the vision tower.
++                        cached_embedding = cached_embedding.to(
++                            self._mm_cache_spill_device, non_blocking=True
++                        )
++                        torch.cuda.current_stream(
++                            cached_embedding.device
++                        ).synchronize()
++
++            if cached_embedding is not None:
++                # Hit: publish the embedding the same way _run_forward would and
++                # release the waiters, so no vision tower runs at all.
++                if self.rank == 0:
++                    try:
++                        self.engine.register(
++                            cached_embedding.data_ptr(), cached_embedding.nbytes
++                        )
++                        self._forward_results[req_id][
++                            "mr_ptr"
++                        ] = cached_embedding.data_ptr()
++                    except Exception as reg_err:
++                        logger.warning(
++                            f"Shared-MR register failed for cached {req_id}, "
++                            f"falling back to per-/send register: {reg_err}"
++                        )
++                        self._forward_results[req_id]["mr_ptr"] = None
++                    self._forward_results[req_id]["embedding"] = cached_embedding
++                    if encoder_metrics_collector is not None:
++                        encoder_metrics_collector.record_cache_files(1, 1, modality=modality.name.lower())
++                event.set()
++                return (nbytes, total_tokens, embedding_dim, None, None)
++
+             async def _run_forward():
+                 try:
++                    forward_start = time.perf_counter()
+                     with torch.inference_mode():
+                         emb = get_feature_fn([mm_item])
+                         if len(emb.shape) != 2:
+@@ -2086,6 +2326,17 @@ class MMEncoder:
+                         if emb.is_cuda:
+                             torch.cuda.current_stream(emb.device).synchronize()
+                     if self.rank == 0:
++                        if encoder_metrics_collector is not None:
++                            # Upstream records this only in _encode(), so on the
++                            # mooncake path encoder_model_forward_seconds stayed
++                            # flat at zero -- the one metric that tells a cache
++                            # hit from a vision-tower pass, silently unavailable
++                            # on exactly the transport where the cache was
++                            # missing to begin with.
++                            encoder_metrics_collector.observe_model_forward(
++                                time.perf_counter() - forward_start,
++                                modality=modality.name.lower(),
++                            )
+                         # Register the MR exactly once here so all sibling-TP /send coroutines share a single registration.
+                         try:
+                             self.engine.register(emb.data_ptr(), emb.nbytes)
+@@ -2097,6 +2348,25 @@ class MMEncoder:
+                             )
+                             self._forward_results[req_id]["mr_ptr"] = None
+                         self._forward_results[req_id]["embedding"] = emb
++                        if use_mm_cache:
++                            # Keep the GPU tensor; the next request for the same
++                            # image reuses it without a vision-tower pass.
++                            async with self.mm_cache_lock:
++                                # A prefetch that lands mid-spill (i.e. during
++                                # the training phase) must not re-grow the VRAM
++                                # the spill just handed back to the trainer, so
++                                # it is cached on host and picked up by the
++                                # restore's no-op pass.
++                                cached = (
++                                    emb.cpu() if self._mm_cache_spilled else emb
++                                )
++                                self.mm_cache.set(
++                                    mm_hash, EmbeddingResult(embedding=cached)
++                                )
++                            if encoder_metrics_collector is not None:
++                                encoder_metrics_collector.record_cache_files(
++                                    0, 1, modality=modality.name.lower()
++                                )
+                 except Exception as e:
+                     logger.error(f"VIT forward failed for {req_id}: {e}")
+                     if self.rank == 0:
+@@ -2736,7 +3006,9 @@ async def _dp_worker_encode_and_send(
+     time_stats.set_mm_encode_start_time()
+     encode_coro = (
+         sched.submit(request)
+-        if sched is not None and modality in _BATCHABLE_MODALITIES
++        if sched is not None
++        and modality in _BATCHABLE_MODALITIES
++        and not enc.server_args.enable_prefix_mm_cache
+         else enc.encode_request(request, modality)
+     )
+     try:
+@@ -3245,12 +3517,17 @@ async def _dp_worker_handle_request(
+         "stop_profile",
+         "health_encode",
+         "send",
++        "spill_mm_cache",
++        "restore_mm_cache",
+     )
+     if is_encode and encoder_metrics_collector is not None:
+         encoder_metrics_collector.inc_requests_received(modality=modality_str)
+     try:
+         if dp_type in ("start_profile", "stop_profile"):
+             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
++        elif dp_type in ("spill_mm_cache", "restore_mm_cache"):
++            # Each DP rank owns an independent mm_cache on its own GPU.
++            content = await getattr(enc, dp_type)()
+         elif dp_type == "health_encode":
+             content = await _dp_worker_health_encode(enc)
+         elif dp_type == "send":
+@@ -3893,7 +4170,16 @@ async def handle_encode_request(request: dict):
+             time_stats.set_mm_encode_start_time()
+             if encoder_metrics_collector is not None:
+                 encoder_metrics_collector.inc_requests_received(modality=modality_str)
+-            if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
++            # batch_encode() runs _encode_missing() and never consults
++            # self.mm_cache, which lives only in _encode().  When
++            # --enable-prefix-mm-cache is on, the cache is worth far more than
++            # batching for workloads that repeat images (an RL group's N samples
++            # share one image set), so take the cached path instead.
++            if (
++                encoder_scheduler is not None
++                and modality in _BATCHABLE_MODALITIES
++                and not encoder.server_args.enable_prefix_mm_cache
++            ):
+                 try:
+                     nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                         await encoder_scheduler.submit(request)
+@@ -4093,6 +4379,50 @@ async def handle_scheduler_receive_url_request(request: dict):
+         cond.notify_all()
+ 
+ 
++async def _mm_cache_memory_op(op: str):
++    """Shared body of /spill_mm_cache and /restore_mm_cache.
++
++    An --encoder-only server has no memory-saver and therefore no
++    /release_memory_occupation, so in a colocate deployment its embedding
++    cache holds VRAM that the trainer sharing the GPU can never get back.
++    These two routes give the orchestrator the one lever that matters:
++    park the cache in host RAM for the training phase, page it back in
++    before the next rollout wave.
++
++    No TP fan-out: the on-device cache is gated to tp_size == 1 (a cache hit
++    must not let one rank skip a collective VIT forward), and on every other
++    configuration the cache already lives in host RAM, where these are
++    no-ops.  Revisit together with that gate.
++    """
++    if dp_dispatcher is not None:
++        try:
++            results = await dp_dispatcher.broadcast({"_dp_type": op})
++        except MMError as e:
++            return Response(content=f"{e}\n", status_code=int(e.code))
++        return _summarise_dp_broadcast(results)
++    if encoder is None:
++        return Response(content="encoder not ready\n", status_code=503)
++    fn = encoder.spill_mm_cache if op == "spill_mm_cache" else encoder.restore_mm_cache
++    try:
++        return ORJSONResponse(content=await fn())
++    except Exception as e:
++        logger.error(f"{op} failed: {e}", exc_info=True)
++        return Response(
++            content=f"{op} failed: {e}\n",
++            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
++        )
++
++
++@app.post("/spill_mm_cache")
++async def handle_spill_mm_cache():
++    return await _mm_cache_memory_op("spill_mm_cache")
++
++
++@app.post("/restore_mm_cache")
++async def handle_restore_mm_cache():
++    return await _mm_cache_memory_op("restore_mm_cache")
++
++
+ @app.get("/health")
+ @app.get("/health_generate")
+ async def health_generate():

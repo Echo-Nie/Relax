@@ -1,0 +1,55 @@
+# Encoder-disaggregated (EPD) student rollout for the 8-GPU MOPD recipe.
+#
+# GPU map inside the shared colocate placement group (8 bundles = actor total):
+#   bundle 0        -> encoder      (TP1, vision tower only, GPU-resident)
+#   bundle 1..4     -> student LM   (2 engines x TP2, language_only)
+#   bundle 5..7     -> OPD teachers (3 replicas x TP1, from resource["teacher"])
+#
+# `rollout_num_gpus` must therefore be 5 (encoder 1 + LM 4), which keeps both
+# invariants satisfied without touching either assertion:
+#   rollout_num_gpus + teacher_gpus == actor_gpus            (5 + 3 == 8)
+#   sglang_config.total_num_gpus    == rollout_num_gpus      (1 + 4 == 5)
+#
+# Group order matters: `gpu_offset` accumulates in declaration order, so the
+# encoder must come first to land on bundle 0.
+sglang:
+  - name: actor
+    engine_groups:
+      - worker_type: encoder
+        num_gpus: 1
+        num_gpus_per_engine: 1
+        overrides:
+          # The launch script uses `--sglang-load-format dummy`, which relies on
+          # the first weight sync to fill in real weights. The encoder never
+          # joins that sync (SGLang's --encoder-only server has no
+          # /update_weights_from_* route), so without this it would serve
+          # embeddings from a randomly-initialised ViT, silently and forever.
+          # _compute_server_args sets the same default; kept explicit here.
+          load_format: auto
+        env:
+          # Post-ViT embedding cache. On an encoder server these are CPU
+          # tensors, so this is host RAM -- unlike every other engine, where the
+          # identically-named var caches GPU tensors that are never freed on
+          # sleep. Never export it globally.
+          #
+          # Sizing: ~90-115 unique images/step at 39-64 MiB each is 3.9-6.4 GiB;
+          # the prefetch needs step N and step N+1 resident at once.
+          # ⚠️ Units differ by transport. On zmq_to_scheduler the cached tensor
+          # is host memory (encoder does .cpu() first), so this is RAM and
+          # effectively free. On mooncake the tensor stays on the GPU so it can
+          # be RDMA'd device-to-device, and this bounds *VRAM* on a card the
+          # colocated actor also trains on (GPU0 measured ~63 GiB during
+          # training already). One step is ~110 unique images x ~50 MiB
+          # ~= 5.5 GiB, so 8 GiB covers a step plus headroom for the prefetch
+          # overlap without pushing GPU0 near the 97 GiB limit.
+          SGLANG_VLM_CACHE_SIZE_MB: "8192"
+          # NOTE: the encoder-eviction guard
+          # (SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL) does NOT belong
+          # here. The EncoderBootstrapServer that does the probing and the
+          # evicting lives in the *language* server's tokenizer manager, not in
+          # the encoder, so setting it on this group has no effect -- that
+          # mistake cost one run. It is exported globally by the launch script
+          # instead; it is inert on engines that are not language_only.
+      - worker_type: regular
+        num_gpus: 4
+        num_gpus_per_engine: 2

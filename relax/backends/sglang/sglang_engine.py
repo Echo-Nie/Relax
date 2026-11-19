@@ -178,6 +178,10 @@ _GENRM_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
 _GENRM_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
 _SGLANG_HTTP_ATTEMPT_TIMEOUT_S = 30.0
 _MIN_HTTP_TIMEOUT_S = 1.0
+# Encoder embedding-cache spill/restore. Bounded so a wedged encoder cannot
+# stall the whole colocate offload barrier. The work itself is a bulk memcpy of
+# at most SGLANG_VLM_CACHE_SIZE_MB over PCIe (8 GiB is ~1s), so this is slack.
+_ENCODER_MM_CACHE_SPILL_TIMEOUT_S = 120.0
 
 
 def _preferred_s3_stream_load_format() -> str:
@@ -338,7 +342,27 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
       installs ``_patched_run_scheduler_process``, which applies the
       routing-replay patch unconditionally.
+
+    ``--encoder-only`` servers use a completely different entrypoint
+    (``srt.disaggregation.encode_server``): a standalone FastAPI app owning an
+    ``MMEncoder``, with no Scheduler and no ModelRunner.  SGLang's own
+    ``sglang.launch_server.run_server`` is what branches on ``encoder_only``;
+    since we call ``launch_server`` directly, that dispatch has to be
+    reproduced here or the flag is silently ignored and a full LLM server comes
+    up instead.
     """
+    if server_args.encoder_only:
+        from sglang.srt.disaggregation.encode_server import launch_server as launch_encode_server
+
+        from relax.backends.sglang.encode_cache_only_patch import apply_encode_cache_only_patch
+
+        # Prefetch primitive for cross-step overlap: ``/encode`` with
+        # ``cache_only=true`` runs the vision tower and fills the prefix-mm
+        # cache without pushing the embedding to anyone.  Inert otherwise.
+        apply_encode_cache_only_patch()
+        launch_encode_server(server_args)
+        return
+
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -408,12 +432,13 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         base_url=server_args.url(),
         api_key=server_args.api_key,
         is_process_alive=lambda: p.is_alive(),
+        has_flush_cache=not server_args.encoder_only,
     )
 
     return p
 
 
-def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
+def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None, has_flush_cache=True):
     """Wait until the server at *base_url* is healthy.
 
     Args:
@@ -424,6 +449,9 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
         timeout: Maximum wall-clock seconds to wait.  ``None`` means no
             limit (backward-compatible default).  A ``TimeoutError`` is
             raised when the deadline is exceeded.
+        has_flush_cache: Whether the server exposes ``/flush_cache``.  An
+            ``--encoder-only`` server does not (it has no KV cache and no
+            scheduler), so polling it there would spin until the timeout.
     """
     headers = {
         "Content-Type": "application/json; charset=utf-8",
@@ -455,6 +483,9 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
                 raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
+
+        if not has_flush_cache:
+            return
 
         # use flush_cache to make sure the working queue is empty, so that we can do offload
         while True:
@@ -522,6 +553,7 @@ class SGLangEngine(RayActor):
         nccl_port,
         host=None,
         disaggregation_bootstrap_port=None,
+        encoder_bootstrap_port=None,
         router_ip=None,
         router_port=None,
         init_external_kwargs: Optional[dict] = None,
@@ -570,6 +602,7 @@ class SGLangEngine(RayActor):
             base_gpu_id=self.base_gpu_id,
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
+            encoder_bootstrap_port=encoder_bootstrap_port,
         )
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
@@ -1402,6 +1435,23 @@ class SGLangEngine(RayActor):
             {"tags": tags},
         )
 
+    def spill_mm_cache(self, timeout: float = _ENCODER_MM_CACHE_SPILL_TIMEOUT_S):
+        """Park the encoder's embedding cache in host RAM (encoder-only
+        servers).
+
+        This is the encoder's stand-in for ``release_memory_occupation``: an
+        ``--encoder-only`` server has no memory-saver, so its multi-GiB
+        embedding cache would otherwise stay pinned on a GPU the colocated
+        actor is training on.  Spilling rather than clearing is deliberate --
+        clearing would throw away exactly what the cross-step prefetch just
+        computed.
+        """
+        return self._make_request("spill_mm_cache", timeout=timeout)
+
+    def restore_mm_cache(self, timeout: float = _ENCODER_MM_CACHE_SPILL_TIMEOUT_S):
+        """Page a spilled encoder embedding cache back onto the GPU."""
+        return self._make_request("restore_mm_cache", timeout=timeout)
+
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
@@ -2127,6 +2177,7 @@ def _compute_server_args(
     base_gpu_id: int | None = None,
     sglang_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
+    encoder_bootstrap_port: int | None = None,
 ):
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
@@ -2192,6 +2243,31 @@ def _compute_server_args(
     elif worker_type == "decode":
         kwargs["disaggregation_mode"] = "decode"
         kwargs["prefill_round_robin_balance"] = True
+    elif worker_type == "encoder":
+        kwargs["encoder_only"] = True
+        # Post-ViT embedding cache, keyed by image content hash.  This is what
+        # makes cross-step prefetch pay off: the prefetch fills it, the real
+        # request hits it.  SGLang requires encoder_only for this flag.
+        kwargs["enable_prefix_mm_cache"] = True
+        # encoder_only is mutually exclusive with disaggregation prefill/decode.
+        kwargs["disaggregation_mode"] = "null"
+        # The encoder never joins the weight-sync group (no
+        # /update_weights_from_* route), so a dummy load would leave it serving
+        # embeddings from randomly-initialised ViT weights -- silently, with no
+        # error anywhere.  It has to read the real checkpoint itself.  Same
+        # reasoning as the OPD teacher, cf. relax/utils/opd/opd_utils.py.
+        kwargs["load_format"] = "auto"
+        # encode_server has no torch_memory_saver integration; the process is
+        # GPU-resident for its whole lifetime (which is also what lets it
+        # prefetch while the actor trains).
+        kwargs["enable_memory_saver"] = False
+
+    if encoder_bootstrap_port is not None:
+        # Every language_only tokenizer manager starts its own
+        # EncoderBootstrapServer, and SGLang's default port is a fixed 8997, so
+        # two EPD consumers on one node collide on bind. Relax allocates a
+        # distinct port per engine instead.
+        kwargs["encoder_bootstrap_port"] = encoder_bootstrap_port
 
     if args.use_rollout_routing_replay:
         kwargs["enable_return_routed_experts"] = True

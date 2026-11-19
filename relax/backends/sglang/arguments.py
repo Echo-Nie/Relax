@@ -349,6 +349,74 @@ def validate_args(args):
         getattr(args, "sglang_config", None) is not None and getattr(args, "prefill_num_servers", None) is not None
     ), "sglang_config and prefill_num_servers are mutually exclusive. Use engine_groups in the YAML config instead."
 
+    _validate_encoder_disaggregation(args)
+
+
+def _validate_encoder_disaggregation(args) -> None:
+    """Validate an ``worker_type: encoder`` topology from ``--sglang-config``.
+
+    Encoder disaggregation moves the vision tower onto its own SGLang
+    ``--encoder-only`` engines.  That server has no ``/update_weights_from_*``,
+    no ``/release_memory_occupation`` and no cache-invalidation route, and its
+    embedding cache is keyed purely by image content, so every constraint below
+    exists to keep a *silently wrong* configuration from starting.
+    """
+    if getattr(args, "sglang_config", None) is None:
+        return
+
+    from relax.distributed.ray.rollout import SglangConfig
+
+    config = SglangConfig.from_yaml(args.sglang_config)
+    if not config.has_encoder_disaggregation:
+        return
+
+    for model in config.models:
+        if not model.has_encoder_disaggregation:
+            continue
+        if not model.encoder_consumer_groups:
+            raise ValueError(
+                f"sglang_config model '{model.name}' has an 'encoder' group but no 'regular'/'prefill' group "
+                "to consume its embeddings. An encoder alone serves no traffic."
+            )
+        encoder_engine_count = 0
+        for group in model.encoder_groups:
+            per_engine = group.num_gpus_per_engine or model.num_gpus_per_engine or args.rollout_num_gpus_per_engine
+            encoder_engine_count += group.num_gpus // min(per_engine, args.num_gpus_per_node)
+        if encoder_engine_count != 1:
+            raise ValueError(
+                f"sglang_config model '{model.name}' declares {encoder_engine_count} encoder engines; exactly 1 "
+                "is supported. SGLang spreads multimodal items over encoders with a random shuffle "
+                "(srt/disaggregation/encode_receiver.py::_assign_items_by_modality), which destroys the "
+                "--enable-prefix-mm-cache hit rate that both EPD and the cross-step prefetch depend on."
+            )
+
+    # The encoder is loaded once from the checkpoint and never weight-synced, so
+    # a trainable vision tower would make it drift from the policy after the
+    # very first update -- and, because a language_only server still keeps its
+    # own ViT for local fallback, dispatched and fallback requests would then
+    # disagree on the same policy version.
+    if not getattr(args, "freeze_vision_model", False):
+        raise ValueError(
+            "Encoder disaggregation (worker_type: encoder) currently requires --freeze-vision-model. "
+            "The SGLang --encoder-only server exposes no weight-update endpoint, so its vision tower "
+            "cannot be re-synced after an optimizer step; without freezing, the encoder would serve "
+            "embeddings from a stale ViT while the language engines hold a fresh one. "
+            "Pass --freeze-vision-model, or drop the encoder group."
+        )
+
+    # The OPD pre-expanded patch rewrites QwenVLImageProcessor.process_mm_data_async,
+    # but a language_only engine bypasses that function entirely for dispatched
+    # requests (embeddings come from the encoder, input_ids are rebuilt receiver
+    # side).  Ordinary base64 rollout requests are unaffected -- they never carry
+    # the opd_preexpanded_raw marker -- but the student-at-teacher-topk prefill does.
+    if getattr(args, "use_opd", False) and getattr(args, "opd_log_prob_top_k", None):
+        raise ValueError(
+            "Encoder disaggregation is incompatible with OPD top-k student prefill "
+            "(--opd-log-prob-top-k). Those requests carry image_data with "
+            "format='opd_preexpanded_raw', which a language_only engine dispatches to the encoder, "
+            "and the encoder does not understand that format. Disable one of the two."
+        )
+
 
 def sglang_parse_args():
     """Parse sglang server arguments independently using a separate
