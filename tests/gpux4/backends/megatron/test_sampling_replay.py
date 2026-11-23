@@ -96,17 +96,51 @@ def _worker(rank, tp, cp, layout, rendezvous):
             advantage_estimator="grpo",
             loss_type="policy_loss",
         )
+        unconcat_tokens = [torch.tensor(t, device=device) for t in TOKENS]
+        mask_ids, mask_offsets = [m.ids for m in masks], [m.offsets for m in masks]
+        if layout == "get_batch":
+            from megatron.training.global_vars import set_args
+
+            from relax.backends.megatron.data import DataIterator, get_batch
+
+            set_args(args)
+            source = {
+                "tokens": unconcat_tokens,
+                "total_lengths": lengths,
+                "response_lengths": response_lengths,
+                "loss_masks": [torch.ones(n, device=device) for n in response_lengths],
+                "advantages": [torch.ones(n) for n in response_lengths],
+                "rollout_sampling_mask_ids": mask_ids,
+                "rollout_sampling_mask_offsets": mask_offsets,
+            }
+            packed = get_batch(DataIterator(source, micro_batch_size=3), list(source), pad_multiplier=1)
+            assert packed["tokens"].device == device
+            assert all(t.device == device for t in packed["advantages"])
+            for field, original in (
+                ("rollout_sampling_mask_ids", mask_ids),
+                ("rollout_sampling_mask_offsets", mask_offsets),
+            ):
+                for actual, expected_csr in zip(packed[field], original, strict=True):
+                    assert actual.device.type == "cpu"
+                    assert actual.dtype == expected_csr.dtype
+                    assert torch.equal(actual, expected_csr)
+            unconcat_tokens = packed["unconcat_tokens"]
+            lengths, response_lengths = packed["total_lengths"], packed["response_lengths"]
+            mask_ids, mask_offsets = packed["rollout_sampling_mask_ids"], packed["rollout_sampling_mask_offsets"]
+            pad = packed["tokens"].size(1) - logits.size(1)
+            positions.extend([-1] * pad)
+            logits = torch.cat([logits.detach(), logits.new_zeros(1, pad, hi - lo)], dim=1).requires_grad_()
         _, result = get_log_probs_and_entropy(
             logits,
             args=args,
-            unconcat_tokens=[torch.tensor(t, device=device) for t in TOKENS],
+            unconcat_tokens=unconcat_tokens,
             total_lengths=lengths,
             response_lengths=response_lengths,
             padded_total_lengths=PADDED if cp > 1 else None,
             cp_output_is_zigzag=layout == "already_zigzag",
             use_rollout_sampling_replay=True,
-            rollout_sampling_mask_ids=[m.ids for m in masks],
-            rollout_sampling_mask_offsets=[m.offsets for m in masks],
+            rollout_sampling_mask_ids=mask_ids,
+            rollout_sampling_mask_offsets=mask_offsets,
             with_entropy=True,
         )
         for actual, all_expected, indices in zip(result["log_probs"], expected, owned_rows, strict=True):
@@ -129,7 +163,14 @@ def _worker(rank, tp, cp, layout, rendezvous):
 
 @pytest.mark.parametrize(
     "tp,cp,layout",
-    [(2, 1, "zigzag"), (1, 2, "zigzag"), (1, 2, "allgather"), (1, 2, "already_zigzag"), (2, 2, "allgather")],
+    [
+        (2, 1, "get_batch"),
+        (2, 1, "zigzag"),
+        (1, 2, "zigzag"),
+        (1, 2, "allgather"),
+        (1, 2, "already_zigzag"),
+        (2, 2, "allgather"),
+    ],
 )
 def test_sampling_replay_nccl_logprob_gradient_and_cp_alignment(tp, cp, layout, tmp_path):
     if torch.cuda.device_count() < tp * cp:

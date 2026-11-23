@@ -27,6 +27,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
+from relax.utils.sampling_mask import SAMPLING_MASK_FIELDS
 from relax.utils.straggler import straggler_rollout_end
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
@@ -1872,8 +1873,11 @@ def move_tensors_to_device(data: Any, device: torch.device, *, non_blocking: boo
     if isinstance(data, dict):
         # MoonViT consumes grid_thws as Python geometry. Preserve host metadata
         # instead of copying it to CUDA only to synchronize it back in forward.
+        # Sampling replay also selects CSR rows on CPU before building its GPU mask.
         return {
-            k: v if k == "grid_thws" else move_tensors_to_device(v, device, non_blocking=non_blocking)
+            k: v
+            if k in ("grid_thws", *SAMPLING_MASK_FIELDS)
+            else move_tensors_to_device(v, device, non_blocking=non_blocking)
             for k, v in data.items()
         }
     if isinstance(data, list):
