@@ -56,6 +56,7 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+from .sampling_replay import sampling_replay_keep_mask, sampling_replay_response_indices
 from .score_centering import (
     align_score_centering_candidate_ids,
     build_score_centering_context,
@@ -432,6 +433,9 @@ def get_log_probs_and_entropy(
     dynamic_cp_rank: int | None = None,
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
     selective_logit_rows: list[tuple[int, torch.Tensor]] | None = None,
+    use_rollout_sampling_replay: bool = False,
+    rollout_sampling_mask_ids: list[torch.Tensor] | None = None,
+    rollout_sampling_mask_offsets: list[torch.Tensor] | None = None,
     **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Compute per-token log-probabilities (and optionally entropy) on
@@ -493,7 +497,7 @@ def get_log_probs_and_entropy(
     if not is_score_centering:
         validate_opd_topk_gather(args, gather_topk_token_ids)
     sc_cp_size = dynamic_cp_size
-    if is_score_centering and sc_cp_size is None:
+    if (is_score_centering or use_rollout_sampling_replay) and sc_cp_size is None:
         sc_cp_size = mpu.get_context_parallel_world_size()
     if is_score_centering and not cp_output_is_zigzag:
         gather_topk_token_ids = align_score_centering_candidate_ids(
@@ -524,12 +528,70 @@ def get_log_probs_and_entropy(
         sft_chunk_size = getattr(args, "sft_logits_chunk_size", 1024)
         if sft_chunk_size <= 0:
             sft_chunk_size = 1024
+    if use_rollout_sampling_replay:
+        if lm_head_forward is not None:
+            raise ValueError("sampling replay requires materialized actor logits")
+        if args.rollout_temperature <= 0:
+            raise ValueError("sampling replay requires rollout_temperature > 0")
+        if rollout_sampling_mask_ids is None or rollout_sampling_mask_offsets is None:
+            raise ValueError("sampling replay requires both CSR fields in every actor microbatch")
+        if len(rollout_sampling_mask_ids) != len(response_lengths) or len(rollout_sampling_mask_offsets) != len(
+            response_lengths
+        ):
+            raise ValueError("sampling replay CSR fields must match the microbatch sample count")
+        for offsets, response_length in zip(rollout_sampling_mask_offsets, response_lengths, strict=True):
+            if offsets.numel() != response_length + 1:
+                raise ValueError("sampling replay offsets must match response_length")
     resolved_topk_k = topk_k if topk_k is not None else getattr(args, "opd_log_prob_top_k", 0)
     tp_group = mpu.get_tensor_model_parallel_group()
 
     # Keep entropy metrics, but skip saving entropy-backward activations when
     # the entropy term cannot affect the loss.
     with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
+
+    def score_response(
+        sample_idx: int,
+        logits_chunk: torch.Tensor,
+        tokens_chunk: torch.Tensor,
+        *,
+        include_entropy: bool = with_entropy,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        keep_mask = None
+        if use_rollout_sampling_replay:
+            cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+            cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
+            indices = sampling_replay_response_indices(
+                sample_index=sample_idx,
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+                local_seq_length=logits.shape[0] * logits.shape[1],
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                allgather_cp=args.allgather_cp,
+                cp_output_is_zigzag=cp_output_is_zigzag,
+                qkv_format=args.qkv_format,
+                max_seq_len=max_seq_lens[sample_idx] if max_seq_lens is not None else None,
+                padded_total_length=padded_total_lengths[sample_idx] if padded_total_lengths is not None else None,
+            )
+            keep_mask = sampling_replay_keep_mask(
+                rollout_sampling_mask_ids[sample_idx],
+                rollout_sampling_mask_offsets[sample_idx],
+                indices,
+                tokens_chunk,
+                vocab_start=mpu.get_tensor_model_parallel_rank() * logits_chunk.size(-1),
+                local_vocab_size=logits_chunk.size(-1),
+                vocab_size=mpu.get_tensor_model_parallel_world_size() * logits_chunk.size(-1),
+            )
+        return calculate_log_probs_and_entropy(
+            logits_chunk,
+            tokens_chunk,
+            tp_group,
+            with_entropy=include_entropy,
+            with_entropy_grad=with_entropy_grad,
+            chunk_size=args.log_probs_chunk_size,
+            log_prob_keep_mask=keep_mask,
+        )
+
     responses = get_responses(
         logits,
         args=args,
@@ -545,7 +607,7 @@ def get_log_probs_and_entropy(
         dynamic_cp_rank=dynamic_cp_rank,
     )
     if is_score_centering:
-        with torch.no_grad():
+        with torch.set_grad_enabled(use_rollout_sampling_replay and torch.is_grad_enabled()):
             response_views = list(responses)
         res = get_score_centering_batch(
             logits,
@@ -557,6 +619,13 @@ def get_log_probs_and_entropy(
             with_topk=with_topk,
             topk_k=resolved_topk_k,
         )
+        if use_rollout_sampling_replay:
+            # Preserve SC candidate scoring and entropy; replay only sampled actor logprob.
+            res["log_probs"] = []
+            for sample_idx, (raw_logits, tokens_chunk) in enumerate(response_views):
+                scaled_logits = raw_logits.float() / args.rollout_temperature
+                log_prob, _ = score_response(sample_idx, scaled_logits, tokens_chunk, include_entropy=False)
+                res["log_probs"].append(log_prob.squeeze(-1))
     elif lm_head_forward is not None:
         res = {"log_probs": []}
         if gather_topk_token_ids is not None:
@@ -599,14 +668,7 @@ def get_log_probs_and_entropy(
         if gather_topk_token_ids is not None:
             res["topk_log_probs"] = []
         for sample_idx, (logits_chunk, tokens_chunk) in enumerate(responses):
-            log_prob, entropy = calculate_log_probs_and_entropy(
-                logits_chunk,
-                tokens_chunk,
-                tp_group,
-                with_entropy=with_entropy,
-                with_entropy_grad=with_entropy_grad,
-                chunk_size=args.log_probs_chunk_size,
-            )
+            log_prob, entropy = score_response(sample_idx, logits_chunk, tokens_chunk)
             res["log_probs"].append(log_prob.squeeze(-1))
             if with_entropy:
                 res["entropy"].append(entropy)
@@ -627,7 +689,10 @@ def get_log_probs_and_entropy(
     if (
         args.allgather_cp
         and not cp_output_is_zigzag
-        and (sc_cp_size if is_score_centering else mpu.get_context_parallel_world_size()) > 1
+        and (
+            sc_cp_size if is_score_centering or use_rollout_sampling_replay else mpu.get_context_parallel_world_size()
+        )
+        > 1
     ):
         _allgather_cp_redistribute(
             res,
@@ -637,8 +702,8 @@ def get_log_probs_and_entropy(
             response_lengths=response_lengths,
             max_seq_lens=max_seq_lens,
             padded_total_lengths=padded_total_lengths,
-            dynamic_cp_size=dynamic_cp_size if is_score_centering else None,
-            dynamic_cp_rank=dynamic_cp_rank if is_score_centering else None,
+            dynamic_cp_size=dynamic_cp_size if is_score_centering or use_rollout_sampling_replay else None,
+            dynamic_cp_rank=dynamic_cp_rank if is_score_centering or use_rollout_sampling_replay else None,
         )
 
     return torch.empty((0,), device=logits.device), res
@@ -1068,6 +1133,9 @@ def policy_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
+        use_rollout_sampling_replay=getattr(args, "use_rollout_sampling_replay", False),
+        rollout_sampling_mask_ids=batch.get("rollout_sampling_mask_ids"),
+        rollout_sampling_mask_offsets=batch.get("rollout_sampling_mask_offsets"),
         with_entropy=with_entropy,
         gather_topk_token_ids=(
             batch["rollout_topk_token_ids"] if is_score_centering else resolve_opd_gather_topk_token_ids(args, batch)

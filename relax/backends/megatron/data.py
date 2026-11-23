@@ -1579,6 +1579,8 @@ def log_rollout_data(
                 "sample_export_ids",
                 "agentic_group_ids",
                 "rollout_routed_experts",
+                "rollout_sampling_mask_ids",
+                "rollout_sampling_mask_offsets",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
                 "rollout_topk_support_complete",
