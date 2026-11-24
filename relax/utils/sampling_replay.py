@@ -35,8 +35,13 @@ def validate_sampling_replay_args(args: Namespace) -> None:
         if getattr(args, field, None):
             raise ValueError(f"sampling replay does not support {field}")
     rollout = getattr(args, "rollout_function_path", None)
-    if rollout and rollout != "relax.engine.rollout.sglang_rollout.generate_rollout":
-        raise ValueError("sampling replay requires the standard SGLang rollout function")
+    standard_rollout = (
+        "relax.agentic.rollout.generate_rollout"
+        if getattr(args, "use_agentic_rollout", False)
+        else "relax.engine.rollout.sglang_rollout.generate_rollout"
+    )
+    if rollout and rollout != standard_rollout:
+        raise ValueError(f"sampling replay requires the standard rollout function: {standard_rollout}")
     if getattr(args, "use_slime_router", False) and "RadixTreeMiddleware" in getattr(
         args, "slime_router_middleware_paths", []
     ):
