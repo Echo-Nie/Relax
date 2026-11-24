@@ -93,6 +93,18 @@ def test_preflight_allows_tcp_time_wait_but_rejects_a_live_listener(monkeypatch)
     preflight(args)
 
 
+def test_preflight_rejects_occupied_sglang_rendezvous_port(monkeypatch):
+    monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: "0, 0")
+    with socket.socket() as http, socket.socket() as rendezvous:
+        http.bind(("127.0.0.1", 0))
+        port = http.getsockname()[1]
+        rendezvous.bind(("0.0.0.0", port + 1000))
+        rendezvous.listen()
+        http.close()
+        with pytest.raises(OSError):
+            preflight(argparse.Namespace(gpu=0, port=port))
+
+
 def test_analysis_rejects_missing_evaluation_runs(tmp_path):
     run = tmp_path / "completed-run"
     run.mkdir()

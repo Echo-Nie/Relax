@@ -278,6 +278,14 @@ async def evaluate(args: argparse.Namespace) -> None:
             )
 
 
+def server_ports(http_port: int) -> tuple[int, int]:
+    """Assign separate HTTP and rendezvous ports to each evaluation
+    instance."""
+    if not 1 <= http_port <= 64535:
+        raise ValueError("HTTP port must leave room for the rendezvous port at HTTP + 1000")
+    return http_port, http_port + 1000
+
+
 def preflight(args: argparse.Namespace) -> None:
     # The per-run port and GPU must be free; never steal or clean shared services.
     gpu = subprocess.check_output(
@@ -293,10 +301,12 @@ def preflight(args: argparse.Namespace) -> None:
     memory, utilization = map(int, gpu.strip().split(","))
     if memory > 100 or utilization:
         raise ValueError(f"GPU {args.gpu} is busy: {gpu.strip()}")
-    with socket.socket() as sock:
-        # Match SGLang's listener: TIME_WAIT is reusable, a live listener is not.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", args.port))
+    http_port, rendezvous_port = server_ports(args.port)
+    for host, port in (("127.0.0.1", http_port), ("0.0.0.0", rendezvous_port)):
+        with socket.socket() as sock:
+            # Match the listeners: TIME_WAIT is reusable, a live listener is not.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
 
 
 def run(args: argparse.Namespace) -> None:
@@ -341,6 +351,8 @@ def run(args: argparse.Namespace) -> None:
         "127.0.0.1",
         "--port",
         str(args.port),
+        "--nccl-port",
+        str(server_ports(args.port)[1]),
         "--tp-size",
         "1",
         "--dtype",
