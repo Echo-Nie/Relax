@@ -30,6 +30,7 @@ from relax.utils.opd.opd_utils import (
     validate_managed_opd_teacher_colocate_args,
     validate_opd_args,
 )
+from relax.utils.sampling_replay import validate_sampling_replay_args
 from relax.utils.training.eval_config import (
     EvalDatasetConfig,
     build_eval_dataset_configs,
@@ -2277,6 +2278,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="The rollout routing replay technique from https://arxiv.org/abs/2510.11370",
             )
             parser.add_argument(
+                "--use-rollout-sampling-replay",
+                action="store_true",
+                default=False,
+                help="Capture SGLang sampling support and replay it for Megatron actor logprobs.",
+            )
+            parser.add_argument(
                 "--use-rollout-indexer-replay",
                 action="store_true",
                 default=False,
@@ -4055,6 +4062,7 @@ def apply_custom_config_overrides(args) -> None:
     # Check before normalization, as on the CLI path: conflicting coefficients
     # must not become valid merely because sync PPO later disables reward KL.
     validate_kl_coefficients(args)
+    validate_sampling_replay_args(args)
 
     if is_offline_mode(args):
         return
@@ -4261,6 +4269,7 @@ def relax_validate_args(args):
 
     _normalize_sft_tq_timeout(args, is_offline)
     _validate_agentic_rollout_args(args)
+    validate_sampling_replay_args(args)
     validate_save_hf_fp8_args(args)
     validate_save_hf_post_hook_args(args)
 

@@ -57,6 +57,12 @@ from relax.utils.opd.opd_multimodal import (
 )
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.sampling_mask import RolloutSamplingMask
+from relax.utils.sampling_replay import (
+    configure_sampling_replay_request,
+    parse_sampling_replay_response,
+    sampling_replay_prefix,
+)
 from relax.utils.score_centering import (
     append_score_centering_candidates,
     configure_score_centering_request,
@@ -389,6 +395,11 @@ async def generate(
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
+    replay_enabled = getattr(args, "use_rollout_sampling_replay", False) and not evaluation
+    if replay_enabled and getattr(state, "partial_genrm", None) is not None:
+        raise ValueError("sampling replay capture does not support Partial GenRM token rewriting")
+    prefix_mask = sampling_replay_prefix(sample) if replay_enabled else None
+    has_response = sample.response_length > 0 if replay_enabled else len(sample.response) > 0
     opd_enabled = opd.is_opd_enabled(args, evaluation=evaluation)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
@@ -405,6 +416,8 @@ async def generate(
     _has_media = sample.multimodal_inputs is not None and any(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
+    if replay_enabled and _has_media:
+        raise ValueError("sampling replay capture currently supports text-only rollout")
     native_image_opd = opd_enabled and _has_media
     if native_image_opd:
         image_inputs(sample.multimodal_inputs)
@@ -430,13 +443,18 @@ async def generate(
     else:
         processor_prompt_ids = tokenizer_prompt_ids
 
-    if len(sample.response) > 0:
+    if has_response:
         sampling_params["max_new_tokens"] -= len(sample.tokens) - len(processor_prompt_ids)
 
     assert sampling_params["max_new_tokens"] >= 0, (
         f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
     )
     if sampling_params["max_new_tokens"] == 0:
+        if replay_enabled:
+            sample.tokens = sample.tokens or processor_prompt_ids
+            sample.rollout_tokens = sample.rollout_tokens or tokenizer_prompt_ids
+            sample.rollout_sampling_mask = prefix_mask
+            sample.rollout_log_probs = sample.rollout_log_probs or []
         sample.status = Sample.Status.TRUNCATED
         return sample
 
@@ -454,6 +472,8 @@ async def generate(
     if opd_enabled:
         state.opd_manager.before_rollout(payload)
     sc_sampling_mode = configure_score_centering_request(args, payload) if not evaluation else None
+    if replay_enabled:
+        configure_sampling_replay_request(args, payload)
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
     # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
     # base model only and rollouts would not reflect the trained policy.
@@ -477,7 +497,7 @@ async def generate(
         payload.update(encoded_mm)
 
     # Use existing tokens for multi-turn or tokenize the new prompt
-    if len(sample.response) > 0:
+    if has_response:
         payload["input_ids"] = sample.rollout_tokens
     else:
         payload["input_ids"] = tokenizer_prompt_ids
@@ -520,6 +540,7 @@ async def generate(
     ):
         raise GenerationAborted
 
+    replay_result = parse_sampling_replay_response(output, top_k=args.rollout_top_k) if replay_enabled else None
     sc_result = None
     if sc_sampling_mode is not None:
         sc_result = parse_score_centering_response(
@@ -556,6 +577,10 @@ async def generate(
         else:
             new_response_tokens = output["output_ids"]
             new_response_log_probs = []
+
+        if replay_result is not None:
+            new_response_tokens = list(replay_result[0])
+            new_response_log_probs = replay_result[1]
 
         if opd_enabled:
             new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
@@ -618,6 +643,11 @@ async def generate(
             raise ValueError(
                 "Score Centering requires unchanged generated token IDs to preserve behavior probabilities"
             )
+        if replay_result is not None:
+            if new_response_tokens != replay_result[0]:
+                raise ValueError("sampling replay requires unchanged generated token IDs")
+            sample.rollout_sampling_mask = RolloutSamplingMask.concatenate([prefix_mask, replay_result[2]])
+            new_response_log_probs = replay_result[1]
         sample.tokens = sample.tokens + new_response_tokens
         sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
         sample.response_length += len(new_response_tokens)
@@ -691,6 +721,8 @@ async def _dispatch_generate(
     unfinished response without failing the group call.
     """
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    if getattr(args, "use_rollout_sampling_replay", False) and not evaluation and custom_func_path:
+        raise ValueError("sampling replay capture does not support custom generation functions")
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
     manages_permit = bool(getattr(custom_generate_func, "manages_inference_permit", False))
 
