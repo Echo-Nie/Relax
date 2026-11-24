@@ -63,7 +63,8 @@ def prepare(args: argparse.Namespace) -> None:
         key = prompt_key(data[index])
         if key in train_keys or key in seen:
             continue
-        ids = tokenizer.apply_chat_template(data[index]["prompt"], add_generation_prompt=True)
+        text = tokenizer.apply_chat_template(data[index]["prompt"], tokenize=False, add_generation_prompt=True)
+        ids = tokenizer.encode(text, add_special_tokens=False)
         if len(ids) > 1024:
             continue
         selected.append(index)

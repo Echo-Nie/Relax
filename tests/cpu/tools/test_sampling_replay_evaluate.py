@@ -2,14 +2,23 @@
 confounding."""
 
 import argparse
+import hashlib
 import json
+import random
 import socket
 import subprocess
 import sys
 
 import pytest
 
-from scripts.tools.sampling_replay_evaluate import analyze, compare, preflight, process_identity, status_or_stop
+from scripts.tools.sampling_replay_evaluate import (
+    analyze,
+    compare,
+    preflight,
+    prepare,
+    process_identity,
+    status_or_stop,
+)
 
 
 def record(index, tokens, response, correct):
@@ -91,3 +100,37 @@ def test_analysis_rejects_missing_evaluation_runs(tmp_path):
     args = argparse.Namespace(root=tmp_path, expected_runs=2)
     with pytest.raises(ValueError, match="Expected 2 complete evaluation runs"):
         analyze(args)
+
+
+def test_prepare_filters_actual_chat_tokens_with_dictionary_tokenizer_output(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "w": 1}, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    tokenizer.chat_template = "{{ messages[0]['content'] }}"
+    tokenizer.save_pretrained(tmp_path / "model")
+    order = list(range(258))
+    random.Random(20261124).shuffle(order)
+    long_index = next(i for i in order if i > 64)
+    data = [
+        dict(prompt=[dict(role="user", content=f"id{i} " + ("w " * 1200 if i == long_index else "w"))], label="1")
+        for i in range(258)
+    ]
+    source = tmp_path / "source.jsonl"
+    source.write_text("".join(json.dumps(row) + "\n" for row in data))
+    original = dict(
+        source=str(source),
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        model=str(tmp_path / "model"),
+        model_sha256={},
+        source_indices=dict(train=[0], eval=list(range(1, 65))),
+    )
+    (tmp_path / "manifest.json").write_text(json.dumps(original))
+    prepare(argparse.Namespace(base=tmp_path, root=tmp_path / "prepared"))
+    manifest = json.loads((tmp_path / "prepared/manifest.json").read_text())
+    assert len(manifest["source_indices"]) == 256
+    assert long_index not in manifest["source_indices"]
