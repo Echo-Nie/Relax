@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from scripts.tools.sampling_replay_evaluate import compare, preflight, process_identity, status_or_stop
+from scripts.tools.sampling_replay_evaluate import analyze, compare, preflight, process_identity, status_or_stop
 
 
 def record(index, tokens, response, correct):
@@ -82,3 +82,12 @@ def test_preflight_allows_tcp_time_wait_but_rejects_a_live_listener(monkeypatch)
                 connection.shutdown(socket.SHUT_WR)
                 assert client.recv(1) == b""
     preflight(args)
+
+
+def test_analysis_rejects_missing_evaluation_runs(tmp_path):
+    run = tmp_path / "completed-run"
+    run.mkdir()
+    (run / "repeat-0.jsonl").write_text(json.dumps(record(10, [3], "x", False)) + "\n")
+    args = argparse.Namespace(root=tmp_path, expected_runs=2)
+    with pytest.raises(ValueError, match="Expected 2 complete evaluation runs"):
+        analyze(args)

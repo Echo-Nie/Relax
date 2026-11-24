@@ -412,6 +412,8 @@ def analyze(args: argparse.Namespace) -> None:
     runs = sorted(args.root.glob("*/repeat-*.jsonl"))
     if not runs:
         raise ValueError("No evaluation results; formal evaluation may still be pending")
+    if args.expected_runs and len({path.parent for path in runs}) != args.expected_runs:
+        raise ValueError(f"Expected {args.expected_runs} complete evaluation runs")
     manifest = read_json(args.manifest)
     indices = manifest["source_indices"]
     expected = set(indices["eval"] if isinstance(indices, dict) else indices)
@@ -457,6 +459,7 @@ def main() -> None:
     parser.add_argument("--port", type=int)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--expected-runs", type=int, default=0)
     args = parser.parse_args()
     required = dict(
         preflight=["gpu", "port"],
@@ -470,8 +473,8 @@ def main() -> None:
     for field in required[args.command]:
         if getattr(args, field) is None:
             parser.error(f"{args.command} requires --{field}")
-    if args.repeats < 1 or args.concurrency < 1:
-        parser.error("repeats and concurrency must be positive")
+    if args.repeats < 1 or args.concurrency < 1 or args.expected_runs < 0:
+        parser.error("repeats/concurrency must be positive; expected-runs must be nonnegative")
     if args.command in ("status", "stop"):
         status_or_stop(args)
     else:
