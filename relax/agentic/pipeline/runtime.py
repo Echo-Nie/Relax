@@ -43,6 +43,8 @@ from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.sampling_mask import RolloutSamplingMask
+from relax.utils.sampling_replay import configure_sampling_replay_request, parse_sampling_replay_response
 from relax.utils.score_centering import (
     configure_score_centering_request,
     parse_score_centering_response,
@@ -192,6 +194,7 @@ class BackendGenerateResult:
     new_topk_token_ids: np.ndarray | None = None
     new_topk_log_probs: np.ndarray | None = None
     new_topk_support_complete: np.ndarray | None = None
+    new_sampling_mask: RolloutSamplingMask | None = None
 
 
 class BackendContextLengthExceededError(RuntimeError):
@@ -606,6 +609,7 @@ class SGLangBackendAdapter:
         video_data: list[str] | None = None,
         return_logprob: bool = True,
         collect_score_centering: bool = True,
+        collect_sampling_replay: bool = True,
         fail_fast_no_workers: bool = False,
         lora_path: str | None = None,
         engine_url: str | None = None,
@@ -623,6 +627,11 @@ class SGLangBackendAdapter:
             if return_logprob and collect_score_centering
             else None
         )
+        replay_enabled = getattr(self._args, "use_rollout_sampling_replay", False) and collect_sampling_replay
+        if replay_enabled:
+            if image_data or audio_data or video_data:
+                raise ValueError("sampling replay capture currently supports text-only rollout")
+            configure_sampling_replay_request(self._args, payload)
         if self._args.use_rollout_routing_replay:
             payload["return_routed_experts"] = True
         if image_data:
@@ -660,6 +669,7 @@ class SGLangBackendAdapter:
                 return BackendGenerateResult(
                     new_tokens=[],
                     new_log_probs=[],
+                    new_sampling_mask=RolloutSamplingMask.from_rows([]) if replay_enabled else None,
                     finish_type="abort",
                     meta_info={},
                     elapsed=time.monotonic() - started,
@@ -681,7 +691,14 @@ class SGLangBackendAdapter:
                 return_support_complete=True,
             )
             tokens, sampled_logprobs, topk_token_ids, topk_log_probs, support_complete = sc_result
+        sampling_mask = None
+        if replay_enabled:
+            tokens, sampled_logprobs, sampling_mask = parse_sampling_replay_response(
+                output, top_k=self._args.rollout_top_k
+            )
         sanitized_tokens = _sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor)
+        if replay_enabled and sanitized_tokens != tokens:
+            raise ValueError("sampling replay requires unchanged generated token IDs")
         if sc_sampling_mode is not None and sanitized_tokens != tokens:
             raise ValueError(
                 "Score Centering requires the original sampled token IDs; token sanitization changed them."
@@ -689,6 +706,7 @@ class SGLangBackendAdapter:
         return BackendGenerateResult(
             new_tokens=sanitized_tokens,
             new_log_probs=sampled_logprobs,
+            new_sampling_mask=sampling_mask,
             finish_type=str(meta_info["finish_reason"]["type"]),
             meta_info=meta_info,
             elapsed=elapsed,

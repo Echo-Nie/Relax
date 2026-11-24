@@ -21,8 +21,6 @@ def validate_sampling_replay_args(args: Namespace) -> None:
         or getattr(args, "loss_type", "policy_loss") != "policy_loss"
     ):
         raise ValueError("sampling replay requires Megatron policy_loss")
-    if getattr(args, "use_agentic_rollout", False):
-        raise ValueError("sampling replay Agentic support is deferred to PR 3B")
     if getattr(args, "multimodal_keys", None):
         raise ValueError("sampling replay capture currently supports text-only rollout")
     if getattr(args, "use_opd", False):

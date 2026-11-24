@@ -310,6 +310,7 @@ def _forest_with_initial_obs(
     index: int | None = None,
     label: str | None = None,
     train_metadata: dict[str, Any] | None = None,
+    replay: bool = False,
 ):
     forest = SessionForest.create_empty(
         session_id=session_id,
@@ -318,6 +319,7 @@ def _forest_with_initial_obs(
         label=label,
         train_metadata=train_metadata,
         metadata=metadata,
+        use_rollout_sampling_replay=replay,
     )
     initial_obs = forest.append_obs(
         parent_state_hash=forest.root_state_hash,
@@ -516,9 +518,13 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     assert session_spec.input_payload["messages"] == [{"role": "user", "content": "hello"}]
 
 
-def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> None:
+@pytest.mark.parametrize("replay", [False, True])
+def test_score_centering_forest_preserves_multiturn_and_branch_candidates(replay: bool) -> None:
+    from relax.utils.sampling_mask import RolloutSamplingMask
+
     forest, initial_obs = _forest_with_initial_obs(
         session_id="sc-branches",
+        replay=replay,
         messages=[{"role": "user", "content": "prompt"}],
         train_token_delta=[10, 11],
         rollout_token_delta=[10, 11],
@@ -530,6 +536,7 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
         messages_delta=[{"role": "assistant", "content": "a"}],
         token_delta=[97],
         logprob_delta=[0.0],
+        sampling_mask_delta=RolloutSamplingMask.from_rows([[97]]) if replay else None,
         topk_token_ids_delta=np.array([[97, -1]], dtype=np.int32),
         topk_logprob_delta=np.array([[0.0, -np.inf]], dtype=np.float32),
         topk_support_complete_delta=np.array([True]),
@@ -550,6 +557,7 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
             messages_delta=[{"role": "assistant", "content": chr(token)}],
             token_delta=[token],
             logprob_delta=[-0.5],
+            sampling_mask_delta=RolloutSamplingMask.from_rows([[token, 100]]) if replay else None,
             topk_token_ids_delta=np.array([[token, 100]], dtype=np.int32),
             topk_logprob_delta=np.array([[-0.5, -2.5]], dtype=np.float32),
         )
@@ -562,6 +570,10 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
             sample.rollout_topk_log_probs, [[0.0, -np.inf], [-np.inf, -np.inf], [-np.inf, -np.inf], [-0.5, -2.5]]
         )
         np.testing.assert_array_equal(sample.rollout_topk_support_complete, [True, False, False, False])
+
+        if replay:
+            assert sample.rollout_sampling_mask.ids.tolist() == [97, 20, 21, token, 100]
+            assert sample.rollout_sampling_mask.offsets.tolist() == [0, 1, 2, 3, 5]
 
 
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:
@@ -1605,8 +1617,14 @@ def _router_recovery_shard():
 
 
 @pytest.mark.asyncio
-async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix():
+@pytest.mark.parametrize("replay", [False, True])
+async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix(replay):
     shard, _group, session, ir = _router_recovery_shard()
+    from relax.utils.sampling_mask import RolloutSamplingMask
+
+    ir.use_rollout_sampling_replay = replay
+    if replay:
+        ir.pending_sampling_masks = [RolloutSamplingMask.from_rows([[300, 301]])]
     ir.pending_logprob_delta = [-0.5]
     ir.pending_topk_token_ids_delta = [np.array([[300, 301]], dtype=np.int32)]
     ir.pending_topk_logprob_delta = [np.array([[-0.5, -2.0]], dtype=np.float32)]
@@ -1614,8 +1632,16 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     ir.pending_spec_delta["completion_token_num"] = 1
     ir.pending_prefix_cache_delta["cached_tokens"] = 2
 
-    async def generate(**_kwargs):
-        return SimpleNamespace(new_tokens=[], new_log_probs=[], finish_type="abort", meta_info={}, elapsed=0.1)
+    async def generate(**kwargs):
+        assert kwargs["collect_sampling_replay"] == replay
+        return SimpleNamespace(
+            new_tokens=[],
+            new_log_probs=[],
+            finish_type="abort",
+            meta_info={},
+            elapsed=0.1,
+            new_sampling_mask=RolloutSamplingMask.from_rows([]) if replay else None,
+        )
 
     shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
     task = asyncio.create_task(shard._run_ir(session, ir))
@@ -1625,6 +1651,10 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     assert list(session.queued_irs) == [ir]
     assert ir.pending_token_delta == [300] and ir.abort_count == 1
     assert ir.pending_logprob_delta == [-0.5]
+    if replay:
+        assert [mask.ids.tolist() for mask in ir.pending_sampling_masks] == [[300, 301], []]
+    else:
+        assert ir.pending_sampling_masks == []
     np.testing.assert_array_equal(ir.pending_topk_token_ids_delta[0], [[300, 301]])
     np.testing.assert_array_equal(ir.pending_topk_logprob_delta[0], [[-0.5, -2.0]])
     assert ir.pending_weight_version_delta == ["v1"]
@@ -1673,8 +1703,12 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
 
 
 @pytest.mark.parametrize("capacity_limit", ["budget", "backend_error", "zero_decode"])
-async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_limit: str) -> None:
+@pytest.mark.parametrize("replay", [False, True])
+async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_limit: str, replay: bool) -> None:
+    from relax.utils.sampling_mask import RolloutSamplingMask
+
     shard, _group, session, ir = _router_recovery_shard()
+    ir.use_rollout_sampling_replay = replay
     shard.args.agentic_reasoning_parser = None
     shard.args.agentic_tool_call_parser = None
     shard._max_context_len = lambda _group: 100
@@ -1683,6 +1717,7 @@ async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_
         messages=[{"role": "user", "content": "p"}],
         train_token_delta=[112],
         rollout_token_delta=[112],
+        replay=replay,
     )
     session.forest = forest
     ir.parent_state_hash = observation.state_hash
@@ -1698,6 +1733,7 @@ async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_
                 finish_type="abort",
                 meta_info={"prompt_tokens": 1},
                 elapsed=0.1,
+                new_sampling_mask=RolloutSamplingMask.from_rows([[token, 100]]) if replay else None,
                 new_topk_token_ids=np.array([[token, 100]], dtype=np.int32),
                 new_topk_log_probs=np.array([[logprob, -2.0]], dtype=np.float32),
             ),
@@ -1712,6 +1748,7 @@ async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_
             finish_type="length",
             meta_info={"finish_reason": {"type": "length", "length": 0}, "prompt_tokens": 3},
             elapsed=0.1,
+            new_sampling_mask=RolloutSamplingMask.from_rows([]) if replay else None,
         ),
     )
     shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
@@ -1741,6 +1778,12 @@ async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_
     assert sample.rollout_log_probs == [-1.0, -0.5]
     np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 100], [98, 100]])
     np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[-1.0, -2.0], [-0.5, -2.0]])
+
+    if replay:
+        assert sample.rollout_sampling_mask.ids.tolist() == [97, 100, 98, 100]
+        assert sample.rollout_sampling_mask.offsets.tolist() == [0, 2, 4]
+    else:
+        assert sample.rollout_sampling_mask is None
 
 
 @pytest.mark.parametrize("backend_error", [False, True])

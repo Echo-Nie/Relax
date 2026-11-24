@@ -77,6 +77,7 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
+from relax.utils.sampling_mask import RolloutSamplingMask
 from relax.utils.types import get_spec_token_counts
 
 
@@ -1747,6 +1748,9 @@ class AgenticSessionShard:
                     label=session_spec.label,
                     train_metadata=session_spec.train_metadata,
                     metadata=session_spec.metadata,
+                    use_rollout_sampling_replay=(
+                        rollout_mode == "train" and getattr(self.args, "use_rollout_sampling_replay", False)
+                    ),
                 )
                 self._start_session(
                     session,
@@ -2366,6 +2370,7 @@ class AgenticSessionShard:
                 wall_started_at=wall_started_at,
                 sampling_params=sampling_params,
                 logprobs=logprobs,
+                use_rollout_sampling_replay=forest.use_rollout_sampling_replay,
                 history_train_token_prefix=prefix.train_token_prefix,
                 history_rollout_token_prefix=prefix.rollout_token_prefix,
                 history_backend_image_data=prefix.backend_image_data,
@@ -2779,6 +2784,7 @@ class AgenticSessionShard:
                                 video_data=ir.history_backend_video_data,
                                 return_logprob=group.rollout_mode == "train" or ir.logprobs,
                                 collect_score_centering=group.rollout_mode == "train",
+                                collect_sampling_replay=ir.use_rollout_sampling_replay,
                                 fail_fast_no_workers=router_recovery_enabled,
                                 **managed_kwargs,
                             )
@@ -3015,6 +3021,13 @@ class AgenticSessionShard:
     ) -> None:
         """Accumulate one backend attempt on the stable IR ref."""
 
+        if ir.use_rollout_sampling_replay:
+            mask = result.new_sampling_mask
+            if mask is None:
+                raise ValueError("sampling replay attempt is missing sampling support")
+            if len(mask) != len(result.new_tokens) or len(result.new_log_probs) != len(result.new_tokens):
+                raise ValueError("sampling replay attempt support/logprobs must match generated tokens")
+            ir.pending_sampling_masks.append(mask)
         ir.pending_token_delta.extend(result.new_tokens)
         ir.pending_logprob_delta.extend(result.new_log_probs)
         if getattr(result, "new_topk_token_ids", None) is not None:
@@ -3104,6 +3117,9 @@ class AgenticSessionShard:
             messages_delta=response_messages,
             token_delta=ir.pending_token_delta,
             logprob_delta=ir.pending_logprob_delta,
+            sampling_mask_delta=RolloutSamplingMask.concatenate(ir.pending_sampling_masks)
+            if ir.use_rollout_sampling_replay
+            else None,
             topk_token_ids_delta=np.concatenate(ir.pending_topk_token_ids_delta)
             if ir.pending_topk_token_ids_delta
             else None,

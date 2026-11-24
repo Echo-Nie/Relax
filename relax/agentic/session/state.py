@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
+from relax.utils.sampling_mask import RolloutSamplingMask
 from relax.utils.types import Sample
 
 
@@ -434,6 +435,7 @@ class MsgNode:
     status: str | None = None
     rollout_routed_experts: Any = None
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
+    sampling_mask_delta: RolloutSamplingMask | None = None
 
 
 @dataclass(eq=False)
@@ -467,6 +469,8 @@ class InflightRequest:
     pending_routed_experts: Any = None
     pending_export_metadata_patch: dict[str, Any] = field(default_factory=dict)
     latest_backend_meta: dict[str, Any] = field(default_factory=dict)
+    use_rollout_sampling_replay: bool = False
+    pending_sampling_masks: list[RolloutSamplingMask] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -489,6 +493,7 @@ class SessionForest:
     root_state_hash: str | None = None
     leaf_state_hashes: set[str] = field(default_factory=set)
     nodes_by_hash: dict[str, MsgNode] = field(default_factory=dict)
+    use_rollout_sampling_replay: bool = False
 
     @classmethod
     def create_empty(
@@ -500,6 +505,7 @@ class SessionForest:
         label: str | None = None,
         train_metadata: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        use_rollout_sampling_replay: bool = False,
     ) -> "SessionForest":
         static_metadata = copy.deepcopy(metadata or {})
         forest = cls(
@@ -509,6 +515,7 @@ class SessionForest:
             label=label,
             train_metadata=copy.deepcopy(train_metadata),
             static_metadata=static_metadata,
+            use_rollout_sampling_replay=use_rollout_sampling_replay,
         )
         forest.append_obs(
             parent_state_hash=None,
@@ -615,6 +622,23 @@ class SessionForest:
         if existing is not None:
             if existing.kind != node.kind:
                 raise ValueError(f"State hash collision with mismatched kinds: {existing.kind} vs {node.kind}")
+            if self.use_rollout_sampling_replay and node.kind == "resp":
+                # Canonical messages identify content, not a sampling event.
+                # Keep that identity only when reusing the node preserves q.
+                old_mask, new_mask = existing.sampling_mask_delta, node.sampling_mask_delta
+                if (
+                    existing.train_token_delta != node.train_token_delta
+                    or not torch.equal(old_mask.ids, new_mask.ids)
+                    or not torch.equal(old_mask.offsets, new_mask.offsets)
+                    or any(
+                        not math.isclose(old, new, rel_tol=1e-5, abs_tol=1e-6)
+                        for old, new in zip(existing.logprob_delta, node.logprob_delta, strict=True)
+                    )
+                ):
+                    raise ValueError(
+                        f"sampling replay metadata conflict for canonical response {node.state_hash}: "
+                        "tokens, sampling support or behavior logprobs differ"
+                    )
             return existing
 
         if node.parent_state_hash is None:
@@ -699,6 +723,7 @@ class SessionForest:
         messages_delta: list[dict[str, Any]],
         token_delta: list[int],
         logprob_delta: list[float],
+        sampling_mask_delta: RolloutSamplingMask | None = None,
         topk_token_ids_delta: np.ndarray | None = None,
         topk_logprob_delta: np.ndarray | None = None,
         topk_support_complete_delta: np.ndarray | None = None,
@@ -711,6 +736,12 @@ class SessionForest:
         rollout_routed_experts: Any = None,
         export_metadata_patch: dict[str, Any] | None = None,
     ) -> MsgNode:
+        if self.use_rollout_sampling_replay:
+            if sampling_mask_delta is None:
+                raise ValueError("sampling replay response is missing sampling support")
+            if len(sampling_mask_delta) != len(token_delta) or len(logprob_delta) != len(token_delta):
+                raise ValueError("sampling replay response support/logprobs must match generated tokens")
+            sampling_mask_delta = sampling_mask_delta.prefix(len(token_delta))
         lineage = self.lineage(parent_state_hash)
         previous_routes = next(
             (node.rollout_routed_experts for node in reversed(lineage) if node.rollout_routed_experts is not None),
@@ -738,6 +769,7 @@ class SessionForest:
                 train_token_delta=token_delta,
                 rollout_token_delta=token_delta,
                 logprob_delta=logprob_delta,
+                sampling_mask_delta=sampling_mask_delta,
                 topk_token_ids_delta=topk_token_ids_delta,
                 topk_logprob_delta=topk_logprob_delta,
                 topk_support_complete_delta=topk_support_complete_delta,
@@ -790,6 +822,7 @@ class SessionForest:
         continuation_train_tokens: list[int] = []
         loss_mask: list[int] = []
         rollout_log_probs: list[float] = []
+        sampling_masks: list[RolloutSamplingMask] = []
         topk_token_ids: list[np.ndarray] = []
         topk_log_probs: list[np.ndarray] = []
         topk_support_complete: list[np.ndarray] = []
@@ -824,6 +857,8 @@ class SessionForest:
                 response_node_spans.append([response_start, len(continuation_train_tokens)])
                 loss_mask.extend([1] * len(node.train_token_delta))
                 rollout_log_probs.extend(node.logprob_delta)
+                if self.use_rollout_sampling_replay:
+                    sampling_masks.append(node.sampling_mask_delta)
                 if topk_width is not None:
                     if node.topk_token_ids_delta is None or node.topk_logprob_delta is None:
                         raise ValueError(f"Score Centering candidates missing from response node {node.state_hash}")
@@ -842,6 +877,9 @@ class SessionForest:
             continuation_train_tokens.extend(node.train_token_delta)
             loss_mask.extend([0] * len(node.train_token_delta))
             rollout_log_probs.extend(node.logprob_delta or ([0.0] * len(node.train_token_delta)))
+            if self.use_rollout_sampling_replay:
+                # Use the exact training delta, including tool/template special tokens.
+                sampling_masks.append(RolloutSamplingMask.from_rows([[token] for token in node.train_token_delta]))
             if topk_width is not None:
                 shape = (len(node.train_token_delta), topk_width)
                 topk_token_ids.append(np.full(shape, -1, dtype=np.int32))
@@ -893,6 +931,9 @@ class SessionForest:
             loss_mask=loss_mask,
             weight_versions=weight_versions,
             rollout_log_probs=rollout_log_probs,
+            rollout_sampling_mask=RolloutSamplingMask.concatenate(sampling_masks)
+            if self.use_rollout_sampling_replay
+            else None,
             rollout_topk_token_ids=np.concatenate(topk_token_ids) if topk_token_ids else None,
             rollout_topk_log_probs=np.concatenate(topk_log_probs) if topk_log_probs else None,
             rollout_topk_support_complete=np.concatenate(topk_support_complete) if topk_support_complete else None,

@@ -17,7 +17,7 @@ SUPPORTS = [[[3, 1], [7, 0, 4], [2], [5, 1, 6]], [[6, 2, 0]], [[0, 5]]]
 PADDED = [12, 4, 8]
 
 
-def _worker(rank, tp, cp, layout, rendezvous):
+def _worker(rank, tp, cp, layout, agentic, rendezvous):
     from megatron.core import mpu
 
     from relax.backends.megatron.loss import get_log_probs_and_entropy
@@ -36,12 +36,63 @@ def _worker(rank, tp, cp, layout, rendezvous):
         full = torch.arange(11 * 8, device=device).reshape(11, 8).float().sin()
         reference = full.detach().clone().requires_grad_()
         lengths = [len(t) for t in TOKENS]
-        response_lengths = [len(rows) for rows in SUPPORTS]
+        supports = SUPPORTS
+        masks = [RolloutSamplingMask.from_rows(rows) for rows in supports]
+        if agentic:
+            from types import SimpleNamespace
+
+            from relax.agentic.session.state import SessionForest
+
+            forest = SessionForest.create_empty(session_id="gpu", use_rollout_sampling_replay=True)
+            parent = forest.append_obs(
+                parent_state_hash=forest.root_state_hash,
+                rollout_id=0,
+                abort_count=0,
+                messages_delta=[{"role": "user", "content": "p"}],
+                train_token_delta=[6, 0],
+                rollout_token_delta=[6, 0],
+            )
+            first = forest.append_resp(
+                parent_state_hash=parent.state_hash,
+                rollout_id=0,
+                abort_count=0,
+                messages_delta=[{"role": "assistant", "content": "a"}],
+                token_delta=[3],
+                logprob_delta=[-0.5],
+                sampling_mask_delta=RolloutSamplingMask.from_rows([[3, 1]]),
+            )
+            observation = forest.append_obs(
+                parent_state_hash=first.state_hash,
+                rollout_id=0,
+                abort_count=0,
+                messages_delta=[{"role": "tool", "tool_call_id": "call", "content": "r"}],
+                train_token_delta=[7, 2],
+                rollout_token_delta=[7, 2],
+            )
+            leaf = forest.append_resp(
+                parent_state_hash=observation.state_hash,
+                rollout_id=0,
+                abort_count=0,
+                messages_delta=[{"role": "assistant", "content": "b"}],
+                token_delta=[5],
+                logprob_delta=[-1.0],
+                sampling_mask_delta=RolloutSamplingMask.from_rows([[5, 1, 6]]),
+            )
+            sample = forest.build_sample(
+                leaf_state_hash=leaf.state_hash, tokenizer=SimpleNamespace(decode=lambda tokens, **_: str(tokens))
+            )
+            assert sample.tokens == TOKENS[0]
+            assert sample.loss_mask == [1, 0, 0, 1]
+            assert sample.rollout_log_probs == [-0.5, 0.0, 0.0, -1.0]
+            masks[0] = sample.rollout_sampling_mask
+            # Independent hand-written expectation for the exported rows.
+            supports = [[[3, 1], [7], [2], [5, 1, 6]], *SUPPORTS[1:]]
+        response_lengths = [len(rows) for rows in supports]
         expected = []
         # Independent unsharded torch reference, using the saved ragged rows.
         start = 0
         predictors = []
-        for tokens, rows in zip(TOKENS, SUPPORTS, strict=True):
+        for tokens, rows in zip(TOKENS, supports, strict=True):
             prompt = len(tokens) - len(rows)
             predictors.append([start + prompt - 1 + t for t in range(len(rows))])
             expected.append(
@@ -86,7 +137,6 @@ def _worker(rank, tp, cp, layout, rendezvous):
         local_full = torch.stack([full[p] if p >= 0 else torch.full((8,), 19.0, device=device) for p in positions])
         lo, hi = tp_rank * (8 // tp), (tp_rank + 1) * (8 // tp)
         logits = local_full[:, lo:hi].clone().unsqueeze(0).requires_grad_()
-        masks = [RolloutSamplingMask.from_rows(rows) for rows in SUPPORTS]
         args = Namespace(
             qkv_format="thd",
             allgather_cp=layout in {"allgather", "already_zigzag"},
@@ -162,20 +212,23 @@ def _worker(rank, tp, cp, layout, rendezvous):
 
 
 @pytest.mark.parametrize(
-    "tp,cp,layout",
+    "tp,cp,layout,agentic",
     [
-        (2, 1, "get_batch"),
-        (2, 1, "zigzag"),
-        (1, 2, "zigzag"),
-        (1, 2, "allgather"),
-        (1, 2, "already_zigzag"),
-        (2, 2, "allgather"),
+        (2, 1, "get_batch", False),
+        (2, 1, "zigzag", False),
+        (1, 2, "zigzag", False),
+        (1, 2, "allgather", False),
+        (1, 2, "already_zigzag", False),
+        (2, 2, "allgather", False),
+        (2, 1, "get_batch", True),
+        (1, 2, "zigzag", True),
+        (2, 2, "allgather", True),
     ],
 )
-def test_sampling_replay_nccl_logprob_gradient_and_cp_alignment(tp, cp, layout, tmp_path):
+def test_sampling_replay_nccl_logprob_gradient_and_cp_alignment(tp, cp, layout, agentic, tmp_path):
     if torch.cuda.device_count() < tp * cp:
         pytest.skip(f"requires {tp * cp} GPUs for TP={tp}, CP={cp}")
-    mp.spawn(_worker, args=(tp, cp, layout, str(tmp_path / "rendezvous")), nprocs=tp * cp, join=True)
+    mp.spawn(_worker, args=(tp, cp, layout, agentic, str(tmp_path / "rendezvous")), nprocs=tp * cp, join=True)
 
 
 def _absent_target_worker(rank):

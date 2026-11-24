@@ -206,7 +206,6 @@ def test_sampling_replay_parser_rejects_invalid_server_data(failure):
     [
         {"sglang_sampling_backend": "flashinfer"},
         {"sglang_speculative_algorithm": "EAGLE"},
-        {"use_agentic_rollout": True},
         {"rollout_top_k": -1},
         {"rollout_temperature": 0.0},
         {"train_backend": "fsdp"},
