@@ -3,12 +3,13 @@ confounding."""
 
 import argparse
 import json
+import socket
 import subprocess
 import sys
 
 import pytest
 
-from scripts.tools.sampling_replay_evaluate import compare, process_identity, status_or_stop
+from scripts.tools.sampling_replay_evaluate import compare, preflight, process_identity, status_or_stop
 
 
 def record(index, tokens, response, correct):
@@ -63,3 +64,21 @@ def test_stop_does_not_signal_unrelated_or_reused_pid(tmp_path, stale_identity):
     finally:
         child.terminate()
         child.wait(timeout=5)
+
+
+def test_preflight_allows_tcp_time_wait_but_rejects_a_live_listener(monkeypatch):
+    # Only the external GPU query is isolated; bind/listen/FIN use real TCP.
+    monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: "0, 0")
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        args = argparse.Namespace(gpu=0, port=listener.getsockname()[1])
+        with pytest.raises(OSError):
+            preflight(args)
+        with socket.create_connection(("127.0.0.1", args.port), timeout=2) as client:
+            connection, _ = listener.accept()
+            with connection:
+                connection.shutdown(socket.SHUT_WR)
+                assert client.recv(1) == b""
+    preflight(args)

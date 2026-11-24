@@ -293,6 +293,8 @@ def preflight(args: argparse.Namespace) -> None:
     if memory > 100 or utilization:
         raise ValueError(f"GPU {args.gpu} is busy: {gpu.strip()}")
     with socket.socket() as sock:
+        # Match SGLang's listener: TIME_WAIT is reusable, a live listener is not.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", args.port))
 
 
