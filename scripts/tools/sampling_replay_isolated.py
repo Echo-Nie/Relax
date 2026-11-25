@@ -55,11 +55,18 @@ def start_ticks(pid: int) -> str:
     return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[19]
 
 
-def checked_state(instance: Path) -> dict:
+def checked_state(instance: Path, *, inside: bool = False) -> dict:
     state = json.loads((instance / "state.json").read_text())
     pid = state["pid"]
     current = os.readlink(f"/proc/{pid}/ns/net")
-    if current == os.readlink("/proc/self/ns/net") or current != state["netns"]:
+    caller = os.readlink("/proc/self/ns/net")
+    if current != state["netns"]:
+        raise ValueError("Target must be the recorded private network namespace")
+    if inside:
+        parent = json.loads((instance / "config.json").read_text())["parent_netns"]
+        if current == parent or caller != current:
+            raise ValueError("Caller must be inside the recorded private network namespace, distinct from its parent")
+    elif current == caller:
         raise ValueError("Target must be the recorded private network namespace")
     if start_ticks(pid) != state["start_ticks"]:
         raise ValueError("Namespace holder PID has been reused")

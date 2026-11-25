@@ -101,3 +101,41 @@ def test_gpu_query_rejects_missing_selected_device(monkeypatch):
     monkeypatch.setattr(sampling_replay_isolated.subprocess, "check_output", lambda *a, **k: "0, 0, 0\n")
     with pytest.raises(ValueError, match="exactly the selected GPUs"):
         sampling_replay_isolated.check_gpus_idle("0,1")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity required")
+def test_inner_namespace_accepts_recorded_caller_but_preserves_external_entry_guard(tmp_path, monkeypatch):
+    pid = os.getpid()
+    state = dict(pid=pid, netns="net:[private]", start_ticks=start_ticks(pid))
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    (tmp_path / "config.json").write_text(json.dumps(dict(parent_netns="net:[parent]")))
+    # Only the kernel namespace lookup is isolated. PID identity and the entire
+    # production validator run normally; this reproduces exec -> inner submit.
+    monkeypatch.setattr(sampling_replay_isolated.os, "readlink", lambda path: "net:[private]")
+    with pytest.raises(ValueError, match="private network namespace"):
+        checked_state(tmp_path)
+    assert checked_state(tmp_path, inside=True) == state
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity required")
+@pytest.mark.parametrize("fault", ["parent", "caller", "holder", "pid_reused"])
+def test_inner_namespace_rejects_wrong_ownership_or_identity(tmp_path, monkeypatch, fault):
+    pid = os.getpid()
+    state = dict(pid=pid, netns="net:[private]", start_ticks=start_ticks(pid))
+    if fault == "pid_reused":
+        state["start_ticks"] = "wrong-start-time"
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    (tmp_path / "config.json").write_text(
+        json.dumps(dict(parent_netns="net:[private]" if fault == "parent" else "net:[parent]"))
+    )
+
+    def namespace(path):
+        if path == "/proc/self/ns/net" and fault == "caller":
+            return "net:[parent]"
+        if path == f"/proc/{pid}/ns/net" and fault == "holder":
+            return "net:[replacement]"
+        return "net:[private]"
+
+    monkeypatch.setattr(sampling_replay_isolated.os, "readlink", namespace)
+    with pytest.raises(ValueError, match="namespace|PID"):
+        checked_state(tmp_path, inside=True)

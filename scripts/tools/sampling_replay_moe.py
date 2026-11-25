@@ -234,7 +234,7 @@ def training_argv(root, mode):
 
 def guard_cluster(root, instance, mode):
     """Check ownership before any HTTP/Ray interaction or output creation."""
-    state = checked_state(instance)
+    state = checked_state(instance, inside=True)
     if os.readlink("/proc/self/ns/net") != state["netns"]:
         raise ValueError("Submit only through isolated.py exec into this private namespace")
     config = read(instance / "config.json")
@@ -339,7 +339,7 @@ def submit(args):
             dict(
                 job_id=job,
                 available=available,
-                namespace=checked_state(args.instance),
+                namespace=checked_state(args.instance, inside=True),
                 config=config,
                 git_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
                 manifest_sha256=digest(args.root / "manifest.json"),
@@ -426,7 +426,7 @@ def analyze(args):
     import torch
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-    state = checked_state(args.instance)
+    state = checked_state(args.instance, inside=True)
     if os.readlink("/proc/self/ns/net") != state["netns"]:
         raise ValueError("Analyze through the recorded isolated namespace")
     run = args.root / f"smoke-{args.mode}"

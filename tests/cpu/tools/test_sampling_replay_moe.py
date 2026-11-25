@@ -29,6 +29,7 @@ def test_submission_rejects_host_namespace_before_creating_run(tmp_path):
     (instance / "state.json").write_text(
         json.dumps(dict(pid=os.getpid(), netns=os.readlink("/proc/self/ns/net"), start_ticks=start_ticks(os.getpid())))
     )
+    (instance / "config.json").write_text(json.dumps(dict(parent_netns=os.readlink("/proc/self/ns/net"))))
     with pytest.raises(ValueError, match="private network namespace"):
         guard_cluster(tmp_path, instance, "off")
     assert not (tmp_path / "smoke-off").exists()
@@ -159,7 +160,7 @@ def test_analyze_rejects_rank_aliases_and_invalid_optimizer_evidence(tmp_path, m
         (run / f"parameter-updates-rank{rank}.jsonl").write_text(json.dumps(row) + "\n")
     # Only the remote namespace-owner/status/log service is isolated. Artifact
     # loading, CP slicing and corruption checks execute the real analyzer.
-    monkeypatch.setattr(moe, "checked_state", lambda _: {"netns": os.readlink("/proc/self/ns/net")})
+    monkeypatch.setattr(moe, "checked_state", lambda _, **kwargs: {"netns": os.readlink("/proc/self/ns/net")})
     monkeypatch.setattr(
         moe, "fetch", lambda _url, path: {"logs": "done"} if path.endswith("/logs") else {"status": "SUCCEEDED"}
     )
