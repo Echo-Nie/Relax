@@ -104,7 +104,7 @@ def hold(instance: Path) -> None:
         "--num-cpus",
         "32",
         "--temp-dir",
-        config["tmpdir"] + "/ray",
+        config.get("ray_tmpdir", config["tmpdir"] + "/ray"),
     ]
     os.execvpe(argv[0], argv, instance_env(config))
 
@@ -124,6 +124,7 @@ def create(args: argparse.Namespace) -> None:
         "host_ip": args.host_ip,
         "parent_netns": os.readlink("/proc/self/ns/net"),
         "tmpdir": str(ray_tmpdir),
+        "ray_tmpdir": str(ray_tmpdir if args.ray_tmpdir is not None else ray_tmpdir / "ray"),
     }
     (args.instance / "config.json").write_text(json.dumps(config, indent=2))
     with (args.instance / "ray-head.log").open("w") as log:
