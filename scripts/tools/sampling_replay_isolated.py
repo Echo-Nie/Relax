@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Give each s5678 experiment its own network, Ray cluster and GPU pair.
+"""Give each experiment its own network, Ray cluster and selected GPUs.
 
 This does not submit training. Use exec explicitly to run the existing launcher
 or inspect one private cluster. Never run PID-scanning cleanup in a network
@@ -23,6 +23,34 @@ from pathlib import Path
 GPU_PAIRS = {"off": "2,3", "on": "4,5"}
 
 
+def parse_gpus(value: str) -> str:
+    parts = value.split(",")
+    if not all(part.isascii() and part.isdecimal() for part in parts):
+        raise ValueError("GPUs must be a comma-separated list of integers in 0..7")
+    ids = [int(part) for part in parts]
+    if len(set(ids)) != len(ids) or any(gpu not in range(8) for gpu in ids):
+        raise ValueError("GPUs must be unique integers in 0..7")
+    return ",".join(map(str, ids))
+
+
+def check_gpus_idle(gpus: str) -> None:
+    output = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--id=" + gpus,
+            "--query-gpu=index,memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    )
+    rows = [tuple(map(int, line.split(","))) for line in output.splitlines() if line.strip()]
+    if any(len(row) != 3 for row in rows) or sorted(row[0] for row in rows) != sorted(map(int, gpus.split(","))):
+        raise ValueError("nvidia-smi did not return exactly the selected GPUs")
+    for gpu, memory, utilization in rows:
+        if memory > 100 or utilization:
+            raise ValueError(f"GPU {gpu} is busy: {memory} MiB, utilization {utilization}%")
+
+
 def start_ticks(pid: int) -> str:
     return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[19]
 
@@ -41,7 +69,7 @@ def checked_state(instance: Path) -> dict:
 def instance_env(config: dict) -> dict[str, str]:
     env = dict(os.environ)
     env.update(
-        CUDA_VISIBLE_DEVICES=GPU_PAIRS[config["mode"]],
+        CUDA_VISIBLE_DEVICES=config.get("gpus", GPU_PAIRS[config["mode"]]),
         TMPDIR=config["tmpdir"],
         RAY_TMPDIR=config["tmpdir"],
         RAY_ADDRESS="127.0.0.1:6379",
@@ -100,7 +128,7 @@ def hold(instance: Path) -> None:
         "--dashboard-port",
         "8265",
         "--num-gpus",
-        "2",
+        str(len(config.get("gpus", GPU_PAIRS[config["mode"]]).split(","))),
         "--num-cpus",
         "32",
         "--temp-dir",
@@ -113,6 +141,13 @@ def create(args: argparse.Namespace) -> None:
     if os.geteuid() != 0:
         raise ValueError("Network namespace setup requires root with CAP_SYS_ADMIN/CAP_NET_ADMIN")
     socket.inet_aton(args.host_ip)
+    selected = getattr(args, "gpus", None)
+    gpus = parse_gpus(GPU_PAIRS[args.mode] if selected is None else selected)
+    if args.instance.exists():
+        raise FileExistsError(f"Instance already exists: {args.instance}")
+    if args.ray_tmpdir is not None and args.ray_tmpdir.resolve().exists():
+        raise FileExistsError(f"Cache directory already exists: {args.ray_tmpdir}")
+    check_gpus_idle(gpus)
     args.instance.mkdir(parents=True, exist_ok=False)
     if args.ray_tmpdir is None:
         ray_tmpdir = Path(tempfile.mkdtemp(prefix=f"sr-{args.mode}5678-", dir="/tmp"))
@@ -121,6 +156,7 @@ def create(args: argparse.Namespace) -> None:
         ray_tmpdir.mkdir(parents=True, exist_ok=False)
     config = {
         "mode": args.mode,
+        "gpus": gpus,
         "host_ip": args.host_ip,
         "parent_netns": os.readlink("/proc/self/ns/net"),
         "tmpdir": str(ray_tmpdir),
@@ -174,6 +210,7 @@ def main() -> None:
     p = sub.add_parser("create", help="Start only a private Ray cluster, not training")
     p.add_argument("--instance", type=Path, required=True)
     p.add_argument("--mode", choices=GPU_PAIRS, required=True)
+    p.add_argument("--gpus", help="Physical GPU IDs, e.g. 0,1,2,3,4,5,6,7; defaults to the mode GPU pair")
     p.add_argument("--host-ip", required=True)
     p.add_argument("--ray-tmpdir", type=Path, help="New private cache directory; existing paths are refused")
     p = sub.add_parser("exec", help="Run one explicit command inside the recorded namespace")

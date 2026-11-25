@@ -54,3 +54,50 @@ def test_create_refuses_existing_cache_before_starting_cluster(tmp_path, monkeyp
         sampling_replay_isolated.create(args)
     assert sentinel.read_text() == "owned by another task"
     assert not (args.instance / "config.json").exists()
+
+
+@pytest.mark.parametrize("gpus", ["", "0,,1", "-1", "0,0", "0,00", "8", "0,1.0", "0, 1", "０"])
+def test_create_rejects_invalid_gpu_selection_before_query_or_launch(tmp_path, monkeypatch, gpus):
+    def forbidden_external(*args, **kwargs):
+        pytest.fail("Invalid GPU selection reached an external command")
+
+    monkeypatch.setattr(sampling_replay_isolated.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "check_output", forbidden_external)
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "Popen", forbidden_external)
+    args = argparse.Namespace(
+        instance=tmp_path / "instance", mode="off", host_ip="127.0.0.1", ray_tmpdir=None, gpus=gpus
+    )
+    with pytest.raises(ValueError, match="GPUs must"):
+        sampling_replay_isolated.create(args)
+    assert not args.instance.exists()
+
+
+@pytest.mark.parametrize("busy", ["7, 101, 0", "7, 0, 1"])
+def test_create_rejects_busy_selected_gpu_without_creating_cluster(tmp_path, monkeypatch, busy):
+    def query(command, **kwargs):
+        selected = next(arg.removeprefix("--id=") for arg in command if arg.startswith("--id="))
+        return "\n".join(busy if gpu == "7" else f"{gpu}, 0, 0" for gpu in selected.split(","))
+
+    def forbidden_launch(*args, **kwargs):
+        pytest.fail("Started a cluster with a busy selected GPU")
+
+    monkeypatch.setattr(sampling_replay_isolated.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "check_output", query)
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "Popen", forbidden_launch)
+    args = argparse.Namespace(
+        instance=tmp_path / "instance",
+        mode="off",
+        host_ip="127.0.0.1",
+        ray_tmpdir=tmp_path / "cache",
+        gpus="0,1,2,3,4,5,6,7",
+    )
+    with pytest.raises(ValueError, match="GPU 7 is busy"):
+        sampling_replay_isolated.create(args)
+    assert not args.instance.exists()
+    assert not args.ray_tmpdir.exists()
+
+
+def test_gpu_query_rejects_missing_selected_device(monkeypatch):
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "check_output", lambda *a, **k: "0, 0, 0\n")
+    with pytest.raises(ValueError, match="exactly the selected GPUs"):
+        sampling_replay_isolated.check_gpus_idle("0,1")
