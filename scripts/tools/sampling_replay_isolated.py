@@ -114,11 +114,16 @@ def create(args: argparse.Namespace) -> None:
         raise ValueError("Network namespace setup requires root with CAP_SYS_ADMIN/CAP_NET_ADMIN")
     socket.inet_aton(args.host_ip)
     args.instance.mkdir(parents=True, exist_ok=False)
+    if args.ray_tmpdir is None:
+        ray_tmpdir = Path(tempfile.mkdtemp(prefix=f"sr-{args.mode}5678-", dir="/tmp"))
+    else:
+        ray_tmpdir = args.ray_tmpdir.resolve()
+        ray_tmpdir.mkdir(parents=True, exist_ok=False)
     config = {
         "mode": args.mode,
         "host_ip": args.host_ip,
         "parent_netns": os.readlink("/proc/self/ns/net"),
-        "tmpdir": tempfile.mkdtemp(prefix=f"sr-{args.mode}5678-", dir="/tmp"),
+        "tmpdir": str(ray_tmpdir),
     }
     (args.instance / "config.json").write_text(json.dumps(config, indent=2))
     with (args.instance / "ray-head.log").open("w") as log:
@@ -169,6 +174,7 @@ def main() -> None:
     p.add_argument("--instance", type=Path, required=True)
     p.add_argument("--mode", choices=GPU_PAIRS, required=True)
     p.add_argument("--host-ip", required=True)
+    p.add_argument("--ray-tmpdir", type=Path, help="New private cache directory; existing paths are refused")
     p = sub.add_parser("exec", help="Run one explicit command inside the recorded namespace")
     p.add_argument("--instance", type=Path, required=True)
     p.add_argument("command", nargs=argparse.REMAINDER)

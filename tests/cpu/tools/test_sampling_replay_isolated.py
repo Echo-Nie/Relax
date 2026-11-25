@@ -2,6 +2,7 @@
 
 """The experiment launcher must never enter the caller's shared network."""
 
+import argparse
 import json
 import os
 import sys
@@ -34,3 +35,22 @@ def test_hold_rejects_host_network_before_interface_changes(tmp_path, monkeypatc
     monkeypatch.setattr(sampling_replay_isolated, "setup_loopback", forbidden_network_change)
     with pytest.raises(ValueError, match="Refusing to configure the host network"):
         sampling_replay_isolated.hold(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespace creation required")
+def test_create_refuses_existing_cache_before_starting_cluster(tmp_path, monkeypatch):
+    cache = tmp_path / "other-task-cache"
+    cache.mkdir()
+    sentinel = cache / "sentinel"
+    sentinel.write_text("owned by another task")
+
+    def forbidden_launch(*args, **kwargs):
+        pytest.fail("Started a cluster using an existing task cache")
+
+    monkeypatch.setattr(sampling_replay_isolated.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "Popen", forbidden_launch)
+    args = argparse.Namespace(instance=tmp_path / "instance", mode="off", host_ip="127.0.0.1", ray_tmpdir=cache)
+    with pytest.raises(FileExistsError):
+        sampling_replay_isolated.create(args)
+    assert sentinel.read_text() == "owned by another task"
+    assert not (args.instance / "config.json").exists()
