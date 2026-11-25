@@ -177,3 +177,17 @@ def test_analyze_rejects_rank_aliases_and_invalid_optimizer_evidence(tmp_path, m
         target.write_text(json.dumps({**row, **changed}) + "\n")
         with pytest.raises(ValueError, match="Invalid rank/step"):
             moe.analyze(args)
+
+
+def test_job_runtime_env_merges_with_real_ray_driver_environment(tmp_path):
+    from ray._private.worker import _merge_runtime_env
+
+    from scripts.tools.sampling_replay_moe import job_runtime_env
+
+    job = job_runtime_env(tmp_path)
+    driver = {"env_vars": {"PYTHONPATH": "driver-path", "CUDA_DEVICE_MAX_CONNECTIONS": "1"}}
+    assert _merge_runtime_env(job, driver, override=False) is None
+    merged = _merge_runtime_env(job, driver, override=job["env_vars"].get("RAY_OVERRIDE_JOB_RUNTIME_ENV") == "1")
+    assert merged["env_vars"]["PYTHONPATH"] == "driver-path"
+    assert merged["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] == "1"
+    assert merged["env_vars"]["HF_HOME"] == str(tmp_path / "cache/hf")

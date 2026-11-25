@@ -251,6 +251,40 @@ def guard_cluster(root, instance, mode):
     return config
 
 
+def job_runtime_env(root):
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        in (
+            "PATH",
+            "PYTHONPATH",
+            "LD_LIBRARY_PATH",
+            "MASTER_ADDR",
+            "NCCL_SOCKET_IFNAME",
+            "GLOO_SOCKET_IFNAME",
+            "NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME",
+        )
+    }
+    env["PYTHONPATH"] = str(REPO) + ":" + env.get("PYTHONPATH", "")
+    env.update(
+        RAY_OVERRIDE_JOB_RUNTIME_ENV="1",
+        HF_HUB_OFFLINE="1",
+        TRANSFORMERS_OFFLINE="1",
+        HF_HOME=str(root / "cache/hf"),
+        XDG_CACHE_HOME=str(root / "cache/xdg"),
+        TORCH_EXTENSIONS_DIR=str(root / "cache/torch_extensions"),
+        SGLANG_CACHE_DIR=str(root / "cache/sglang"),
+        TRITON_CACHE_DIR=str(root / "cache/triton"),
+        TORCHINDUCTOR_CACHE_DIR=str(root / "cache/inductor"),
+        OMP_NUM_THREADS="2",
+        MKL_NUM_THREADS="2",
+        OPENBLAS_NUM_THREADS="2",
+        CUDA_DEVICE_MAX_CONNECTIONS="1",
+    )
+    return dict(env_vars=env)
+
+
 def submit(args):
     import fcntl
 
@@ -289,36 +323,7 @@ def submit(args):
             ray.shutdown()
         run = args.root / f"smoke-{args.mode}"
         run.mkdir()
-        job = f"sr-moe-smoke-{args.mode}-s1234"
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k
-            in (
-                "PATH",
-                "PYTHONPATH",
-                "LD_LIBRARY_PATH",
-                "MASTER_ADDR",
-                "NCCL_SOCKET_IFNAME",
-                "GLOO_SOCKET_IFNAME",
-                "NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME",
-            )
-        }
-        env["PYTHONPATH"] = str(REPO) + ":" + env.get("PYTHONPATH", "")
-        env.update(
-            HF_HUB_OFFLINE="1",
-            TRANSFORMERS_OFFLINE="1",
-            HF_HOME=str(args.root / "cache/hf"),
-            XDG_CACHE_HOME=str(args.root / "cache/xdg"),
-            TORCH_EXTENSIONS_DIR=str(args.root / "cache/torch_extensions"),
-            SGLANG_CACHE_DIR=str(args.root / "cache/sglang"),
-            TRITON_CACHE_DIR=str(args.root / "cache/triton"),
-            TORCHINDUCTOR_CACHE_DIR=str(args.root / "cache/inductor"),
-            OMP_NUM_THREADS="2",
-            MKL_NUM_THREADS="2",
-            OPENBLAS_NUM_THREADS="2",
-            CUDA_DEVICE_MAX_CONNECTIONS="1",
-        )
+        job = f"sr-moe-smoke-{args.mode}-s1234-{hashlib.sha256(str(args.root.resolve()).encode()).hexdigest()[:8]}"
         command = [
             "ray",
             "job",
@@ -329,7 +334,7 @@ def submit(args):
             "--submission-id",
             job,
             "--runtime-env-json",
-            json.dumps(dict(env_vars=env)),
+            json.dumps(job_runtime_env(args.root)),
             "--",
             *training_argv(args.root, args.mode),
         ]
