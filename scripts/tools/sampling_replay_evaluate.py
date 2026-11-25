@@ -220,17 +220,43 @@ async def evaluate(args: argparse.Namespace) -> None:
     from relax.utils.arguments import parse_args
     from relax.utils.http_utils import init_http_client
 
-    argv = read_json(args.base / "formal-on-s1234-argv.json")
+    argv = read_json(args.training_argv) if args.training_argv else read_json(args.base / "formal-on-s1234-argv.json")
+    if args.training_argv:
+        argv += [
+            "--eval-prompt-data",
+            "heldout",
+            str(args.data),
+            "--n-samples-per-eval-prompt",
+            str(args.samples_per_prompt),
+            "--eval-temperature",
+            str(args.temperature),
+            "--eval-top-p",
+            str(args.top_p),
+            "--eval-top-k",
+            str(args.top_k),
+            "--eval-max-response-len",
+            str(args.max_response_len),
+            "--eval-max-context-len",
+            str(args.max_context_len),
+        ]
+    if args.chat_template_kwargs is not None:
+        argv += ["--apply-chat-template-kwargs", args.chat_template_kwargs]
     argv = [token for token in argv if token != "--use-rollout-sampling-replay"]
     sys.argv = [sys.argv[0], *argv, "--sglang-server-concurrency", str(args.concurrency)]
     config = parse_args()
+    if args.fixed_sampling_seeds:
+        # Standard evaluation assigns sampling_seed=rollout_seed+j. This does
+        # not enable different server kernels or promise bitwise determinism.
+        config.sglang_enable_deterministic_inference = True
     config.sglang_router_ip, config.sglang_router_port = "127.0.0.1", args.port
     config.use_distributed_post = False
     if config.rm_type != "dapo" or config.custom_rm_path:
         raise ValueError("This evaluation recipe requires the original built-in DAPO reward")
     config.custom_rm_path = "scripts.tools.sampling_replay_evaluate.local_dapo"
     # Keep the original tokenizer, chat template, standard generation and DAPO scorer.
-    dataset = dataclasses.replace(config.eval_datasets[0], name="exp06", path=str(args.data))
+    dataset = dataclasses.replace(
+        config.eval_datasets[0], name="exp08" if args.training_argv else "exp06", path=str(args.data)
+    )
     init_http_client(config)
     async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
         (await client.post(f"http://127.0.0.1:{args.port}/flush_cache")).raise_for_status()
@@ -238,9 +264,12 @@ async def evaluate(args: argparse.Namespace) -> None:
             if repeat:
                 (await client.post(f"http://127.0.0.1:{args.port}/flush_cache")).raise_for_status()
             started = time.time()
-            result = (await eval_rollout_single_dataset(config, 0, dataset))["exp06"]
+            result = (await eval_rollout_single_dataset(config, 0, dataset))[dataset.name]
             samples = result["samples"]
-            if len(samples) != len(rows(args.data)) or result["num_valid_prompts"] != len(samples):
+            group_size = dataset.n_samples_per_eval_prompt
+            if len(samples) != len(rows(args.data)) * group_size or result["num_valid_prompts"] != len(
+                rows(args.data)
+            ):
                 raise ValueError("Incomplete evaluation; refusing partial accuracy")
             manifest = read_json(args.manifest)
             indices = manifest["source_indices"]
@@ -251,7 +280,8 @@ async def evaluate(args: argparse.Namespace) -> None:
                 n = sample.response_length
                 records.append(
                     dict(
-                        source_index=indices[sample.index],
+                        source_index=indices[sample.index // group_size],
+                        completion_index=sample.index % group_size,
                         index=sample.index,
                         input_ids=sample.tokens[:-n] if n else sample.tokens,
                         output_ids=sample.tokens[-n:] if n else [],
@@ -269,6 +299,8 @@ async def evaluate(args: argparse.Namespace) -> None:
                 args.output / f"repeat-{repeat}-summary.json",
                 dict(
                     n=len(records),
+                    questions=len(indices),
+                    samples_per_prompt=group_size,
                     accuracy=sum(row["reward"]["acc"] for row in records) / len(records),
                     reward=sum(row["reward"]["score"] for row in records) / len(records),
                     truncated=sum(row["status"] == "truncated" for row in records),
@@ -322,6 +354,8 @@ def run(args: argparse.Namespace) -> None:
         expected_sha = manifest["data_sha256"]
     if len(indices) != len(rows(args.data)) or sha(args.data) != expected_sha:
         raise ValueError("Dataset differs from the fixed manifest")
+    if args.training_argv and sha(args.training_argv) != manifest["training_argv_sha256"]:
+        raise ValueError("Evaluation argv differs from the fixed manifest")
     preflight(args)
     args.output.mkdir(parents=True, exist_ok=False)
     state = dict(
@@ -334,6 +368,7 @@ def run(args: argparse.Namespace) -> None:
         manifest_sha256=sha(args.manifest),
         git_sha=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         tool_sha256=sha(__file__),
+        training_argv_sha256=sha(args.training_argv) if args.training_argv else None,
         model_files_sha256={
             path.name: sha(path)
             for path in sorted(args.model.iterdir())
@@ -364,9 +399,9 @@ def run(args: argparse.Namespace) -> None:
         "--enable-fp32-lm-head",
         "--disable-cuda-graph",
         "--max-running-requests",
-        "16",
+        str(args.concurrency),
         "--context-length",
-        "2112",
+        str(args.max_context_len + 64),
         "--mem-fraction-static",
         "0.2",
     ]
@@ -463,6 +498,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["prepare", "audit", "preflight", "run", "status", "stop", "analyze"])
     parser.add_argument("--base", type=Path)
+    parser.add_argument("--training-argv", type=Path)
+    parser.add_argument("--chat-template-kwargs")
+    parser.add_argument("--samples-per-prompt", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument("--top-p", type=float, default=1)
+    parser.add_argument("--top-k", type=int, default=1)
+    parser.add_argument("--max-response-len", type=int, default=1024)
+    parser.add_argument("--max-context-len", type=int, default=2048)
+    parser.add_argument("--fixed-sampling-seeds", action="store_true")
     parser.add_argument("--root", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--data", type=Path)
@@ -478,7 +522,7 @@ def main() -> None:
         preflight=["gpu", "port"],
         prepare=["base", "root"],
         audit=["base", "root"],
-        run=["base", "model", "data", "manifest", "output", "gpu", "port"],
+        run=["model", "data", "manifest", "output", "gpu", "port"],
         status=["output"],
         stop=["output"],
         analyze=["root", "manifest"],
@@ -486,6 +530,10 @@ def main() -> None:
     for field in required[args.command]:
         if getattr(args, field) is None:
             parser.error(f"{args.command} requires --{field}")
+    if args.command == "run" and args.base is None and args.training_argv is None:
+        parser.error("run requires --base or --training-argv")
+    if args.samples_per_prompt < 1:
+        parser.error("samples-per-prompt must be positive")
     if args.repeats < 1 or args.concurrency < 1 or args.expected_runs < 0:
         parser.error("repeats/concurrency must be positive; expected-runs must be nonnegative")
     if args.command in ("status", "stop"):
