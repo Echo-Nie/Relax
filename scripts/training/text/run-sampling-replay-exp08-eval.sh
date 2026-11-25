@@ -11,6 +11,9 @@ root=$EXPERIMENT_ROOT
 model=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"])' "$root/manifest.json")
 profile=eval; if [ "$stage" = smoke ]; then profile=eval-smoke; fi
 output="$root/evaluations/$stage/$mode-u$updates"
+mkdir -p "$root/control"
+exec 8>"$root/control/eval-$stage-$mode-u$updates.lock"
+flock -n 8 || { echo 'This checkpoint evaluation is already running' >&2; exit 1; }
 [[ ! -e "$output" ]] || { echo "Result directory exists: $output" >&2; exit 1; }
 [[ "$gpu" =~ ^[0-7]$ ]] || exit 2
 child=""
