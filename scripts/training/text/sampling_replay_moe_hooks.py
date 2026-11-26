@@ -12,6 +12,7 @@ rank records.
 import hashlib
 import json
 import math
+import os
 import re
 from argparse import Namespace
 from pathlib import Path
@@ -167,10 +168,12 @@ def install_observer(
 
 def before_train(args: Namespace, rollout_id: int, step_id: int, model: list, optimizer: Any, scheduler: Any) -> None:
     """Attach through the existing before-train-step experimental hook."""
+    if args.rollout_result_dir and (Path(args.rollout_result_dir) / "quality-stop.json").exists():
+        raise ValueError("Predeclared independent-evaluation quality collapse; preserve evidence")
     install_observer(
         model,
         optimizer,
-        output=Path(args.dump_details),
+        output=Path(os.environ.get("RELAX_MOE_AUDIT_DIR") or args.dump_details),
         rank=dist.get_rank(group=dist.group.WORLD),
         weight_decay=args.weight_decay,
         routing_replay=getattr(args, "use_rollout_routing_replay", False),

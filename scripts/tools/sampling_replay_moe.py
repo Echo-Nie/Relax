@@ -307,7 +307,7 @@ def job_runtime_env(root):
     return dict(env_vars=env)
 
 
-def submit(args):
+def submit(args, *, argv=None, extra_env=None):
     import fcntl
 
     with (args.root / "submit.lock").open("a") as lock:
@@ -356,9 +356,9 @@ def submit(args):
             "--submission-id",
             job,
             "--runtime-env-json",
-            json.dumps(job_runtime_env(args.root)),
+            json.dumps({"env_vars": {**job_runtime_env(args.root)["env_vars"], **(extra_env or {})}}),
             "--",
-            *training_argv(args.root, args.mode),
+            *(argv if argv is not None else training_argv(args.root, args.mode)),
         ]
         write(run / "command.json", command)
         write(
