@@ -146,8 +146,6 @@ def tracking_env(root: Path, tier: str, mode: str) -> dict:
         NO_PROXY=bypass,
         no_proxy=bypass,
         TENSORBOARD_DIR=str(run / "tensorboard_log"),
-        RELAX_MOE_AUDIT_DIR=str(run),
-        CLEARML_TAGS=f"moe,{tier},{mode},seed1234",
         CLEARML_CONFIG_FILE=os.environ.get("CLEARML_CONFIG_FILE", str(Path.home() / "clearml.conf")),
     )
 

@@ -12,7 +12,6 @@ rank records.
 import hashlib
 import json
 import math
-import os
 import re
 from argparse import Namespace
 from pathlib import Path
@@ -173,7 +172,7 @@ def before_train(args: Namespace, rollout_id: int, step_id: int, model: list, op
     install_observer(
         model,
         optimizer,
-        output=Path(os.environ.get("RELAX_MOE_AUDIT_DIR") or args.dump_details),
+        output=Path(args.dump_details) if args.dump_details else Path(args.tensorboard_dir).parent,
         rank=dist.get_rank(group=dist.group.WORLD),
         weight_decay=args.weight_decay,
         routing_replay=getattr(args, "use_rollout_routing_replay", False),
