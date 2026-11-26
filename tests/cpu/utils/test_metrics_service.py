@@ -213,8 +213,9 @@ class TestTrackingUtilsIntegration(unittest.TestCase):
         }
         self.args = create_namespace(args_dict)
 
+    @patch("relax.utils.tracking_utils.init_metrics_service_adapter")
     @patch("relax.utils.tracking_utils.get_metrics_service_adapter")
-    def test_log_with_metrics_service(self, mock_get_adapter):
+    def test_log_with_metrics_service(self, mock_get_adapter, mock_init_adapter):
         """Test tracking_utils.log with metrics service enabled."""
         from relax.utils import tracking_utils
 

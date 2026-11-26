@@ -656,7 +656,9 @@ class Controller:
         from relax.utils.metrics.service import MetricsService
 
         deployment = MetricsService.options(
-            ray_actor_options=with_control_plane_affinity(self.config, {"num_cpus": 1})
+            ray_actor_options=with_control_plane_affinity(
+                self.config, {"num_cpus": 1, "runtime_env": self.runtime_env}
+            )
         ).bind(
             healthy=self._health_manager.status,
             pg=None,
