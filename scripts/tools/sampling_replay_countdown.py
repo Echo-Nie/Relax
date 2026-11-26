@@ -277,7 +277,7 @@ def argv(a):
     result = [
         "python",
         "-m",
-        "relax.entrypoints.train",
+        "scripts.training.text.sampling_replay_countdown_entry",
         *model,
         *flags,
         *[str(v) for k, value in opts.items() for v in (k, value)],
@@ -344,6 +344,7 @@ def tracking_env(root, run):
             "SGLANG_CACHE_DIR",
         ]
     )
+    env["RELAX_COUNTDOWN_RUNTIME_ENV"] = json.dumps(env)
     return env
 
 

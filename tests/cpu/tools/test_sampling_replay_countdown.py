@@ -22,3 +22,32 @@ def test_countdown_quality_rule_does_not_stop_low_initial_reward():
     assert not quality_stop(history)
     history[-5:] = [dict(accuracy=0.0, truncated_fraction=1.0) for _ in range(5)]
     assert quality_stop(history)
+
+
+def test_entry_restores_frozen_runtime_after_native_initialization(monkeypatch):
+    import json
+    import os
+    import sys
+    from types import SimpleNamespace
+
+    from scripts.training.text.sampling_replay_countdown_entry import run
+
+    frozen = {"HTTPS_PROXY": "http://127.0.0.1:18080", "NO_PROXY": "127.96.51.1"}
+    monkeypatch.setenv("RELAX_COUNTDOWN_RUNTIME_ENV", json.dumps(frozen))
+    monkeypatch.setenv("HTTPS_PROXY", "http://old-proxy.invalid:3128")
+    monkeypatch.setenv("NO_PROXY", "localhost")
+    sentinel = object()
+    seen = []
+
+    def parse_args():
+        assert os.environ["HTTPS_PROXY"] == frozen["HTTPS_PROXY"]
+        os.environ.update(HTTPS_PROXY="http://old-proxy.invalid:3128", NO_PROXY="localhost")
+        return sentinel
+
+    def main(args):
+        assert args is sentinel
+        seen.append({key: os.environ[key] for key in frozen})
+
+    monkeypatch.setitem(sys.modules, "relax.entrypoints.train", SimpleNamespace(main=main, parse_args=parse_args))
+    run()
+    assert seen == [frozen]
