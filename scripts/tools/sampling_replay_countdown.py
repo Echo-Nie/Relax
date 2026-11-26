@@ -321,6 +321,27 @@ def tracking_env(root, run):
         PYTHONUNBUFFERED="1",
         CLEARML_CONFIG_FILE=str(Path.home() / "clearml.conf"),
     )
+    env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(
+        [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "TENSORBOARD_DIR",
+            "CLEARML_CONFIG_FILE",
+            "SGLANG_RETURN_ORIGINAL_LOGPROB",
+            "HF_HOME",
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "XDG_CACHE_HOME",
+            "TORCH_EXTENSIONS_DIR",
+            "TORCHINDUCTOR_CACHE_DIR",
+            "TRITON_CACHE_DIR",
+            "SGLANG_CACHE_DIR",
+        ]
+    )
     return env
 
 
