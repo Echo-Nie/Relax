@@ -332,3 +332,22 @@ def test_countdown_budget_delegate_preserves_behavior_and_only_sr_exports_csr(ge
     assert sample.metadata["countdown_support_sizes"] == [2, 1]
     assert args.use_rollout_sampling_replay == (mode == "on")
     assert args.custom_generate_function_path == COUNTDOWN_GENERATOR
+
+
+def test_countdown_evaluation_does_not_require_training_probability_metadata(generate_boundary):
+    from relax.utils.sampling_replay import COUNTDOWN_GENERATOR
+
+    calls, outputs, state = generate_boundary
+    outputs.append(
+        dict(text="answer", output_ids=[3, 1], meta_info=dict(completion_tokens=2, finish_reason=dict(type="stop")))
+    )
+    args = args_for_replay(advantage_estimator="rloo", custom_generate_function_path=COUNTDOWN_GENERATOR)
+    sample = asyncio.run(
+        rollout._dispatch_generate(state, args, Sample(prompt="p"), dict(max_new_tokens=512), evaluation=True)
+    )
+    assert calls[0]["sampling_params"]["max_new_tokens"] == 511
+    assert calls[0]["return_logprob"] is False
+    assert "return_sampling_mask" not in calls[0]
+    assert sample.tokens == [0, 3, 1]
+    assert sample.response == "answer" and sample.response_length == 2
+    assert sample.rollout_sampling_mask is None and sample.rollout_log_probs == []

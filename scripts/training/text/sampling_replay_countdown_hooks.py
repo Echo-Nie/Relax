@@ -16,7 +16,7 @@ async def generate_bounded(args, sample, sampling_params, evaluation=False):
     bounded = importlib.import_module("examples.algorithms.score-centering.recipe").generate_bounded
     sc = args.advantage_estimator == "score_centering"
     capture_args = args
-    if not sc:
+    if not sc and not evaluation:
         # Same-call native behavior q for every RLOO arm. Only SR sends CSR to
         # the Actor; OFF/TIS keep the full-vocabulary Actor and native losses.
         capture_args = copy.copy(args)
@@ -25,7 +25,7 @@ async def generate_bounded(args, sample, sampling_params, evaluation=False):
     result = await bounded(capture_args, sample, sampling_params, evaluation=evaluation)
     if len(result.tokens) > 512:
         raise ValueError("Countdown total-token budget exceeded")
-    if not sc:
+    if not sc and not evaluation:
         mask = result.rollout_sampling_mask
         if mask is None or len(mask) != result.response_length:
             raise ValueError("Countdown native behavior capture missing or misaligned")
