@@ -318,6 +318,7 @@ def tracking_env(root, run):
         no_proxy=bypass,
         TENSORBOARD_DIR=str(run / "tensorboard_log"),
         SGLANG_RETURN_ORIGINAL_LOGPROB="0",
+        SGLANG_ENABLE_JIT_DEEPGEMM="0",  # sender scale layout must match the explicit Triton receiver
         PYTHONUNBUFFERED="1",
         CLEARML_CONFIG_FILE=str(Path.home() / "clearml.conf"),
     )
@@ -332,6 +333,7 @@ def tracking_env(root, run):
             "TENSORBOARD_DIR",
             "CLEARML_CONFIG_FILE",
             "SGLANG_RETURN_ORIGINAL_LOGPROB",
+            "SGLANG_ENABLE_JIT_DEEPGEMM",
             "HF_HOME",
             "HF_HUB_OFFLINE",
             "TRANSFORMERS_OFFLINE",
