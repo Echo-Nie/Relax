@@ -236,7 +236,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="action", required=True)
     p = sub.add_parser("create", help="Start only a private Ray cluster, not training")
     p.add_argument("--instance", type=Path, required=True)
-    p.add_argument("--mode", choices=MODES, required=True)
+    p.add_argument("--mode", choices=(*MODES, "sc-tis"), required=True)
     p.add_argument(
         "--gpus", help="Physical GPU IDs; required for r3/tis/sc, defaults to the legacy mode pair for off/on"
     )

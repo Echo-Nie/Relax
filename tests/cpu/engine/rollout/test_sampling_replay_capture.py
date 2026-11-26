@@ -305,3 +305,30 @@ def test_sampling_replay_rejects_token_rewriting_paths_before_request(generate_b
         else:
             generate(sample)
     assert not calls
+
+
+@pytest.mark.parametrize("mode", ["off", "on", "tis"])
+def test_countdown_budget_delegate_preserves_behavior_and_only_sr_exports_csr(generate_boundary, mode):
+    from relax.utils.sampling_replay import COUNTDOWN_GENERATOR
+
+    calls, outputs, state = generate_boundary
+    outputs.append(response(finish="stop"))
+    args = args_for_replay(
+        use_rollout_sampling_replay=mode == "on",
+        use_tis=mode == "tis",
+        advantage_estimator="rloo",
+        custom_generate_function_path=COUNTDOWN_GENERATOR,
+    )
+    sample = asyncio.run(
+        rollout._dispatch_generate(
+            state, args, Sample(prompt="p"), dict(max_new_tokens=512, temperature=0.7, top_k=4, top_p=0.8)
+        )
+    )
+    assert calls[0]["sampling_params"]["max_new_tokens"] == 511
+    assert calls[0]["return_sampling_mask"] is True
+    assert calls[0]["sampling_logprobs_mode"] == "support"
+    assert sample.rollout_log_probs == [math.log(0.6), 0.0]
+    assert (sample.rollout_sampling_mask is not None) == (mode == "on")
+    assert sample.metadata["countdown_support_sizes"] == [2, 1]
+    assert args.use_rollout_sampling_replay == (mode == "on")
+    assert args.custom_generate_function_path == COUNTDOWN_GENERATOR

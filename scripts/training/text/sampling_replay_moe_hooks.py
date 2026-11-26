@@ -63,6 +63,9 @@ def install_observer(
     rank: int,
     weight_decay: float,
     routing_replay: bool = False,
+    require_optimizer_norm: bool = True,
+    pattern: re.Pattern = _EXPERT_FC2,
+    observation_scope: str = "first 65536 elements of one local trainable expert fc2 parameter",
 ) -> None:
     """Wrap step once and preserve its original arguments and return value."""
     if getattr(optimizer, "sampling_replay_moe_observed", False):
@@ -72,12 +75,12 @@ def install_observer(
             (chunk_index, name, parameter)
             for chunk_index, chunk in enumerate(model)
             for name, parameter in chunk.named_parameters()
-            if parameter.requires_grad and _EXPERT_FC2.search(name)
+            if parameter.requires_grad and pattern.search(name)
         ),
         None,
     )
     if selected is None:
-        raise ValueError("MoE update observer requires a trainable mlp.experts expert fc2 weight")
+        raise ValueError(f"Update observer requires a trainable parameter matching {pattern.pattern}")
     chunk_index, name, parameter = selected
     native_step = optimizer.step
     output.mkdir(parents=True, exist_ok=True)
@@ -127,7 +130,7 @@ def install_observer(
             "parameter_numel": parameter.numel(),
             "sample_offset": 0,
             "sample_elements": before.numel(),
-            "observation_scope": "first 65536 elements of one local trainable expert fc2 parameter",
+            "observation_scope": observation_scope,
             "gradient_source": source if sampled_gradient is not None else None,
             "sampled_gradient_norm": float(sampled_gradient.norm()) if sampled_gradient is not None else 0.0,
             "sampled_gradient_nonzero": int(torch.count_nonzero(sampled_gradient))
@@ -157,7 +160,7 @@ def install_observer(
         with path.open("a") as stream:
             stream.write(json.dumps(row, allow_nan=False) + "\n")
         counter += 1
-        if not finite or grad_norm is None or not result[0]:
+        if not finite or (require_optimizer_norm and grad_norm is None) or not result[0]:
             raise ValueError(f"MoE observer rank {rank}: optimizer failed or non-finite/unavailable norm; see {path}")
         return result
 

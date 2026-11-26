@@ -62,6 +62,7 @@ from relax.utils.sampling_replay import (
     configure_sampling_replay_request,
     parse_sampling_replay_response,
     sampling_replay_prefix,
+    validate_sampling_replay_generator,
 )
 from relax.utils.score_centering import (
     append_score_centering_candidates,
@@ -722,7 +723,7 @@ async def _dispatch_generate(
     """
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     if getattr(args, "use_rollout_sampling_replay", False) and not evaluation and custom_func_path:
-        raise ValueError("sampling replay capture does not support custom generation functions")
+        validate_sampling_replay_generator(custom_func_path)
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
     manages_permit = bool(getattr(custom_generate_func, "manages_inference_permit", False))
 

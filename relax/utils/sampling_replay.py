@@ -13,6 +13,15 @@ from relax.utils.sampling_mask import RolloutSamplingMask
 from relax.utils.types import Sample
 
 
+COUNTDOWN_GENERATOR = "scripts.training.text.sampling_replay_countdown_hooks.generate_bounded"
+
+
+def validate_sampling_replay_generator(path: str | None) -> None:
+    """Only the audited total-budget delegate may wrap native capture."""
+    if path not in (None, COUNTDOWN_GENERATOR):
+        raise ValueError("sampling replay capture does not support this custom generation function")
+
+
 def validate_sampling_replay_args(args: Namespace) -> None:
     if not getattr(args, "use_rollout_sampling_replay", False):
         return
@@ -25,8 +34,11 @@ def validate_sampling_replay_args(args: Namespace) -> None:
         raise ValueError("sampling replay capture currently supports text-only rollout")
     if getattr(args, "use_opd", False):
         raise ValueError("sampling replay capture with OPD is not supported")
+    generator = getattr(args, "custom_generate_function_path", None)
+    validate_sampling_replay_generator(generator)
+    if generator and getattr(args, "use_agentic_rollout", False):
+        raise ValueError("sampling replay Agentic does not support custom generation functions")
     for field in (
-        "custom_generate_function_path",
         "custom_convert_samples_to_train_data_path",
         "rollout_external",
         "sglang_config",

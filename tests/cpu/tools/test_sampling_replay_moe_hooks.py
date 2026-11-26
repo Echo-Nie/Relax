@@ -99,7 +99,7 @@ def test_moe_hooks_reject_nonfinite_gradient_before_update_and_dense_only_models
         optimizer.step()
     torch.testing.assert_close(model.weight, torch.tensor([1.0, 2.0, 3.0]))
     assert not (tmp_path / "parameter-updates-rank0.jsonl").exists()
-    with pytest.raises(ValueError, match="trainable mlp.experts"):
+    with pytest.raises(ValueError, match="trainable parameter"):
         install_observer([torch.nn.Linear(3, 2)], object(), output=tmp_path, rank=0, weight_decay=0)
 
 
@@ -183,3 +183,34 @@ def test_moe_hooks_reject_unconsumed_native_routing_before_optimizer(tmp_path, n
     row = read_row(tmp_path)
     assert row["optimizer_called"] is False
     assert row["routing_replay"]["fully_consumed"] is False
+
+
+def test_dense_sgd_observer_accepts_unavailable_global_norm_without_changing_update(tmp_path):
+    import re
+
+    model = torch.nn.Linear(3, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    native = torch.optim.SGD(model.parameters(), lr=0.25)
+
+    class Optimizer:
+        def step(self):
+            native.step()
+            return True, None, 0
+
+    optimizer = Optimizer()
+    install_observer(
+        [model],
+        optimizer,
+        output=tmp_path,
+        rank=0,
+        weight_decay=0,
+        pattern=re.compile(r"weight$"),
+        require_optimizer_norm=False,
+        observation_scope="dense CPU regression",
+    )
+    model.weight.grad = torch.tensor([[2.0, 0.0, -4.0]])
+    assert optimizer.step() == (True, None, 0)
+    torch.testing.assert_close(model.weight, torch.tensor([[0.5, 1.0, 2.0]]))
+    assert read_row(tmp_path)["optimizer_grad_norm"] is None
+    assert read_row(tmp_path)["changed_elements"] == 2
