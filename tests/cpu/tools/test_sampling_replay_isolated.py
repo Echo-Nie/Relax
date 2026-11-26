@@ -160,3 +160,41 @@ def test_create_rejects_oversized_ray_socket_before_starting_cluster(tmp_path, m
         sampling_replay_isolated.create(args)
     assert not args.instance.exists()
     assert not args.ray_tmpdir.exists()
+
+
+@pytest.mark.parametrize("mode", ["r3", "tis", "sc"])
+def test_new_mode_requires_explicit_gpus_before_query_or_launch(tmp_path, monkeypatch, mode):
+    def forbidden_external(*args, **kwargs):
+        pytest.fail("A new mode without an explicit GPU allocation reached an external command")
+
+    monkeypatch.setattr(sampling_replay_isolated.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "check_output", forbidden_external)
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "Popen", forbidden_external)
+    args = argparse.Namespace(
+        instance=tmp_path / "instance", mode=mode, host_ip="127.0.0.1", ray_tmpdir=None, gpus=None
+    )
+    with pytest.raises(ValueError, match="--gpus is required"):
+        sampling_replay_isolated.create(args)
+    assert not args.instance.exists()
+
+
+@pytest.mark.parametrize("mode", ["r3", "tis", "sc"])
+def test_new_mode_exec_preserves_explicit_gpu_isolation(tmp_path, monkeypatch, mode):
+    # Exercise the production exec boundary: the old eager dictionary fallback
+    # raised KeyError for these modes even when explicit GPUs were configured.
+    gpus = "0,1,2,3,4,5,6,7"
+    (tmp_path / "config.json").write_text(
+        json.dumps(dict(mode=mode, gpus=gpus, tmpdir=str(tmp_path), host_ip="127.9.0.1"))
+    )
+    monkeypatch.setattr(sampling_replay_isolated, "checked_state", lambda instance: {"pid": 123})
+
+    def capture_exec(executable, argv, env):
+        assert executable == "nsenter"
+        assert env["CUDA_VISIBLE_DEVICES"] == gpus
+        assert argv[-2:] == ["python", "--version"]
+        raise SystemExit(0)
+
+    monkeypatch.setattr(sampling_replay_isolated.os, "execvpe", capture_exec)
+    with pytest.raises(SystemExit) as stopped:
+        sampling_replay_isolated.execute(argparse.Namespace(instance=tmp_path, command=["--", "python", "--version"]))
+    assert stopped.value.code == 0

@@ -201,3 +201,47 @@ def test_native_job_metrics_require_one_real_step_and_the_frozen_batch():
     for bad in ("no metrics", record + "\n" + record, record.replace("size': 32", "size': 16")):
         with pytest.raises(ValueError):
             metrics_from_job_log(bad)
+
+
+def test_reference_capture_checks_r3_routes_and_cp_local_sc_candidates():
+    from scripts.tools.sampling_replay_moe import validate_reference_payload
+
+    samples, originals = sample_pair()
+    for o in originals:
+        o["rollout_routed_experts"] = torch.arange(8, dtype=torch.int32).repeat(1, 48, 1)
+    validate_reference_payload(samples, originals, "r3", 0)
+    originals[0]["rollout_routed_experts"][0, 0, -1] = 0
+    with pytest.raises(ValueError, match="Duplicate experts"):
+        validate_reference_payload(samples, originals, "r3", 0)
+    for o, sample in zip(originals, samples):
+        o["rollout_topk_token_ids"] = [[3] + [-1] * 127]
+        o["rollout_topk_log_probs"] = [[0.0] + [-float("inf")] * 127]
+        o["rollout_topk_support_complete"] = [True]
+        for k in ("rollout_topk_token_ids", "rollout_topk_log_probs", "rollout_topk_support_complete"):
+            sample[k] = o[k]
+    assert validate_reference_payload(samples, originals, "sc", 0)["complete_support_rows"] == 32
+    for sample in samples:
+        for k in ("rollout_topk_token_ids", "rollout_topk_log_probs", "rollout_topk_support_complete"):
+            sample[k] = []
+    validate_reference_payload(samples, originals, "sc", 1)
+    samples[0]["rollout_topk_support_complete"] = [True]
+    with pytest.raises(ValueError, match="CP transfer"):
+        validate_reference_payload(samples, originals, "sc", 1)
+
+
+def test_native_tis_changes_gradient_with_zero_to_two_clipping():
+    from argparse import Namespace
+
+    from relax.backends.megatron.loss import vanilla_tis_function
+
+    pg = torch.ones(3, requires_grad=True)
+    weighted, _, metrics = vanilla_tis_function(
+        Namespace(tis_clip_low=0.0, tis_clip=2.0),
+        pg_loss=pg,
+        train_log_probs=[torch.tensor([0.025, 0.1, 0.4]).log()],
+        rollout_log_probs=[torch.tensor([0.1, 0.1, 0.1]).log()],
+        loss_masks=[torch.ones(3)],
+    )
+    weighted.sum().backward()
+    torch.testing.assert_close(pg.grad, torch.tensor([0.25, 1.0, 2.0]))
+    torch.testing.assert_close(metrics["tis_clipfrac"], torch.tensor([0.0, 0.0, 1.0]))

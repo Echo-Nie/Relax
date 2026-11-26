@@ -18,7 +18,7 @@ import subprocess
 from pathlib import Path
 
 from scripts.tools.sampling_replay_ab import digest, fetch
-from scripts.tools.sampling_replay_isolated import checked_state
+from scripts.tools.sampling_replay_isolated import MODES, checked_state
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -130,6 +130,8 @@ def prepare(args):
 
 
 def training_argv(root, mode):
+    if mode not in MODES:
+        raise ValueError("Unknown smoke method")
     manifest = read(root / "manifest.json")
     raw = subprocess.check_output(
         [
@@ -231,6 +233,24 @@ def training_argv(root, mode):
     ]
     if mode == "on":
         argv.append("--use-rollout-sampling-replay")
+    elif mode == "r3":
+        argv.extend(["--use-rollout-routing-replay", "--use-slime-router"])
+    elif mode == "tis":
+        argv.extend(["--use-tis", "--tis-clip-low", "0", "--tis-clip", "2"])
+    elif mode == "sc":
+        argv[argv.index("--advantage-estimator") + 1] = "score_centering"
+        argv.extend(
+            [
+                "--rollout-top-logprobs-num",
+                "128",
+                "--score-centering-is",
+                "none",
+                "--kl-coef",
+                "0",
+                "--use-rollout-logprobs",
+                "--get-mismatch-metrics",
+            ]
+        )
     return argv
 
 
@@ -429,6 +449,71 @@ def validate_samples(samples, originals, replay, *, cp_size=1, cp_rank=0):
     return nonzero
 
 
+def validate_reference_payload(samples, originals, mode, cp_rank):
+    import torch
+
+    from relax.backends.megatron.cp_utils import slice_log_prob_with_cp
+
+    byid = {o["index"]: o for o in originals}
+    complete = 0
+    for sample in samples:
+        o = byid[sample["sample_indices"]]
+        n = o["response_length"]
+        if mode == "r3":
+            routes = torch.as_tensor(o["rollout_routed_experts"])
+            if (
+                routes.dtype != torch.int32
+                or routes.shape != (len(o["tokens"]) - 1, 48, 8)
+                or not ((routes >= 0) & (routes < 128)).all()
+            ):
+                raise ValueError("Invalid native routed expert capture")
+            ordered = routes.sort(-1).values
+            if (ordered[..., 1:] == ordered[..., :-1]).any():
+                raise ValueError("Duplicate experts in a native top8 route")
+        elif mode == "sc":
+            ids = torch.as_tensor(o["rollout_topk_token_ids"], dtype=torch.int64)
+            q = torch.as_tensor(o["rollout_topk_log_probs"], dtype=torch.float32)
+            coverage = torch.as_tensor(o["rollout_topk_support_complete"], dtype=torch.bool)
+            if ids.shape != (n, 128) or q.shape != ids.shape or coverage.shape != (n,):
+                raise ValueError("Invalid SC candidate dimensions")
+            valid = ids >= 0
+            if (
+                not (ids[~valid] == -1).all()
+                or not torch.isneginf(q[~valid]).all()
+                or not torch.isfinite(q[valid]).all()
+                or (q[valid] > 1e-6).any()
+                or (ids[valid] >= 151936).any()
+            ):
+                raise ValueError("Invalid SC candidate IDs or probabilities")
+            for i in range(n):
+                row = ids[i][valid[i]]
+                if row.unique().numel() != row.numel():
+                    raise ValueError("Duplicate SC candidates")
+                if coverage[i]:
+                    loc = (ids[i] == o["tokens"][-n + i]).nonzero().flatten()
+                    if (
+                        loc.numel() != 1
+                        or not torch.isclose(q[i, valid[i]].exp().sum(), torch.tensor(1.0), atol=1e-5, rtol=1e-5)
+                        or not torch.isclose(
+                            q[i, loc[0]], torch.tensor(o["rollout_log_probs"][i]), atol=1e-6, rtol=1e-5
+                        )
+                    ):
+                        raise ValueError("SC complete support does not match behavior")
+            complete += int(coverage.sum())
+            for key, full in (
+                ("rollout_topk_token_ids", ids),
+                ("rollout_topk_log_probs", q),
+                ("rollout_topk_support_complete", coverage),
+            ):
+                expected = slice_log_prob_with_cp(
+                    full, len(o["tokens"]), n, "thd", dynamic_cp_size=2, dynamic_cp_rank=cp_rank
+                )
+                actual = torch.as_tensor(sample[key], dtype=full.dtype)
+                if actual.numel() != expected.numel() or not torch.equal(actual.reshape(expected.shape), expected):
+                    raise ValueError("SC candidates changed across CP transfer")
+    return dict(method=mode, complete_support_rows=complete if mode == "sc" else None)
+
+
 def metrics_from_job_log(text):
     clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
     rows = re.findall(r"step 0: (\{.*\})", clean)
@@ -460,6 +545,7 @@ def analyze(args):
     if {p.name for p in dumps} != {f"0_{rank}.pt" for rank in range(8)}:
         raise ValueError("Expected all eight rank dumps")
     all_nonzero = []
+    reference_payload = []
     for p in sorted(dumps):
         data = torch.load(p, map_location="cpu", weights_only=False)
         rank = int(p.stem.split("_")[1])
@@ -469,6 +555,8 @@ def analyze(args):
         all_nonzero.append(
             validate_samples(data["samples"], originals, args.mode == "on", cp_size=2, cp_rank=rank // 4)
         )
+        if args.mode in ("r3", "sc"):
+            reference_payload.append(validate_reference_payload(data["samples"], originals, args.mode, rank // 4))
     updates = []
     for rank in range(8):
         rows = [json.loads(x) for x in (run / f"parameter-updates-rank{rank}.jsonl").read_text().splitlines()]
@@ -488,6 +576,8 @@ def analyze(args):
             )
         ):
             raise ValueError("Invalid rank/step or non-finite/failed optimizer update")
+        if args.mode == "r3" and not row.get("routing_replay", {}).get("fully_consumed", False):
+            raise ValueError("R3 routing consumption was not verified")
         updates.extend(rows)
     if (run / "tensorboard_log").is_dir():
         tb = EventAccumulator(str(run / "tensorboard_log"), size_guidance={"scalars": 0})
@@ -499,6 +589,12 @@ def analyze(args):
         metrics_source = "job.log native train step 0"
     if not metrics or any(not math.isfinite(x) for v in metrics.values() for x in v):
         raise ValueError("Missing/non-finite metrics")
+    if args.mode == "tis" and any(key not in metrics for key in ("train/tis", "train/tis_abs", "train/tis_clipfrac")):
+        raise ValueError("Native TIS weight metrics are missing")
+    if args.mode == "sc" and any(
+        key not in metrics for key in ("train/sc_correction", "train/sc_support_aligned", "train/sc_importance_weight")
+    ):
+        raise ValueError("Native SC objective metrics are missing")
     # Some versions place TB under the default dump directory; require actual loss evidence.
     if not metrics.get("train/loss") or not any(x > 0 for x in metrics.get("train/grad_norm", [])):
         raise ValueError("No finite training loss/nonzero global gradient evidence")
@@ -516,6 +612,7 @@ def analyze(args):
             updates=updates,
             metrics=metrics,
             metrics_source=metrics_source,
+            reference_payload=reference_payload,
             note="Observed expert slices only; CP/TP math has separate reference tests. No additional diagnostic forward.",
         ),
     )
@@ -536,7 +633,7 @@ def main():
             for flag in ("model", "data", "smoke-data"):
                 c.add_argument("--" + flag, type=Path, required=True)
         else:
-            c.add_argument("--mode", choices=("off", "on"), required=True)
+            c.add_argument("--mode", choices=MODES, required=True)
         if command in ("submit", "analyze"):
             c.add_argument("--instance", type=Path, required=True)
     a = p.parse_args()

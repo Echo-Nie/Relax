@@ -119,3 +119,67 @@ def test_moe_hooks_optimizer_rejection_is_recorded_and_fails(tmp_path):
     assert row["finite"] is False
     assert row["optimizer_grad_norm"] is None
     assert row["changed_elements"] == 0
+
+
+@pytest.fixture
+def native_routing_replays(monkeypatch):
+    from relax.utils.training import routing_replay as routing
+
+    # CPU-only test: isolate the pinned allocator/device boundary, not routing.
+    empty_like = torch.empty_like
+
+    def cpu_empty_like(tensor, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty_like(tensor, **kwargs)
+
+    monkeypatch.setattr(torch, "empty_like", cpu_empty_like)
+    monkeypatch.setattr(routing.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(routing.RoutingReplay, "all_routing_replays", [])
+    expected = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int32)
+    replays = [routing.RoutingReplay() for _ in range(48)]
+    for replay in replays:
+        replay.record(expected)
+        torch.testing.assert_close(replay.pop_forward(), expected.long())
+        torch.testing.assert_close(replay.pop_backward(), expected.long())
+    return routing.RoutingReplay.all_routing_replays
+
+
+def test_moe_hooks_record_real_native_routing_consumption_without_reset(tmp_path, native_routing_replays):
+    model = ExpertModel()
+    optimizer = CoreOptimizer(model.weight)
+    install_observer([model], optimizer, output=tmp_path, rank=0, weight_decay=0, routing_replay=True)
+    model.weight.grad = torch.ones(3)
+    optimizer.step()
+    row = read_row(tmp_path)
+    assert row["routing_replay"]["fully_consumed"]
+    assert row["routing_replay"]["expected_layers"] == len(row["routing_replay"]["layers"]) == 48
+    assert all(
+        layer["recorded_batches"] == layer["forward_consumed"] == layer["backward_consumed"] == 1
+        for layer in row["routing_replay"]["layers"]
+    )
+    assert row["changed_elements"] == 3
+    assert all(
+        replay.forward_index == replay.backward_index == len(replay.top_indices_list) == 1
+        for replay in native_routing_replays
+    )
+
+
+@pytest.mark.parametrize("missing", ["layer", "forward", "backward"])
+def test_moe_hooks_reject_unconsumed_native_routing_before_optimizer(tmp_path, native_routing_replays, missing):
+    if missing == "layer":
+        native_routing_replays.pop()
+    elif missing == "forward":
+        native_routing_replays[-1].clear_forward()
+    else:
+        native_routing_replays[-1].backward_index = 0
+    model = ExpertModel()
+    optimizer = CoreOptimizer(model.weight)
+    install_observer([model], optimizer, output=tmp_path, rank=0, weight_decay=0, routing_replay=True)
+    model.weight.grad = torch.ones(3)
+    with pytest.raises(ValueError, match="routing replay not fully consumed"):
+        optimizer.step()
+    torch.testing.assert_close(model.weight, torch.tensor([1.0, 2.0, 3.0]))
+    assert not hasattr(optimizer, "result")
+    row = read_row(tmp_path)
+    assert row["optimizer_called"] is False
+    assert row["routing_replay"]["fully_consumed"] is False

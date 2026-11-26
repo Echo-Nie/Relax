@@ -21,6 +21,7 @@ from pathlib import Path
 
 
 GPU_PAIRS = {"off": "2,3", "on": "4,5"}
+MODES = (*GPU_PAIRS, "r3", "tis", "sc")
 
 
 def parse_gpus(value: str) -> str:
@@ -31,6 +32,14 @@ def parse_gpus(value: str) -> str:
     if len(set(ids)) != len(ids) or any(gpu not in range(8) for gpu in ids):
         raise ValueError("GPUs must be unique integers in 0..7")
     return ",".join(map(str, ids))
+
+
+def resolve_gpus(mode: str, gpus: str | None = None) -> str:
+    if gpus is None:
+        if mode not in GPU_PAIRS:
+            raise ValueError(f"--gpus is required for {mode}; only off/on have legacy GPU defaults")
+        gpus = GPU_PAIRS[mode]
+    return parse_gpus(gpus)
 
 
 def check_gpus_idle(gpus: str) -> None:
@@ -76,7 +85,7 @@ def checked_state(instance: Path, *, inside: bool = False) -> dict:
 def instance_env(config: dict) -> dict[str, str]:
     env = dict(os.environ)
     env.update(
-        CUDA_VISIBLE_DEVICES=config.get("gpus", GPU_PAIRS[config["mode"]]),
+        CUDA_VISIBLE_DEVICES=resolve_gpus(config["mode"], config.get("gpus")),
         TMPDIR=config["tmpdir"],
         RAY_TMPDIR=config["tmpdir"],
         RAY_ADDRESS="127.0.0.1:6379",
@@ -135,7 +144,7 @@ def hold(instance: Path) -> None:
         "--dashboard-port",
         "8265",
         "--num-gpus",
-        str(len(config.get("gpus", GPU_PAIRS[config["mode"]]).split(","))),
+        str(len(resolve_gpus(config["mode"], config.get("gpus")).split(","))),
         "--num-cpus",
         "32",
         "--temp-dir",
@@ -158,8 +167,7 @@ def create(args: argparse.Namespace) -> None:
     if os.geteuid() != 0:
         raise ValueError("Network namespace setup requires root with CAP_SYS_ADMIN/CAP_NET_ADMIN")
     socket.inet_aton(args.host_ip)
-    selected = getattr(args, "gpus", None)
-    gpus = parse_gpus(GPU_PAIRS[args.mode] if selected is None else selected)
+    gpus = resolve_gpus(args.mode, getattr(args, "gpus", None))
     if args.instance.exists():
         raise FileExistsError(f"Instance already exists: {args.instance}")
     if args.ray_tmpdir is not None and args.ray_tmpdir.resolve().exists():
@@ -228,8 +236,10 @@ def main() -> None:
     sub = parser.add_subparsers(dest="action", required=True)
     p = sub.add_parser("create", help="Start only a private Ray cluster, not training")
     p.add_argument("--instance", type=Path, required=True)
-    p.add_argument("--mode", choices=GPU_PAIRS, required=True)
-    p.add_argument("--gpus", help="Physical GPU IDs, e.g. 0,1,2,3,4,5,6,7; defaults to the mode GPU pair")
+    p.add_argument("--mode", choices=MODES, required=True)
+    p.add_argument(
+        "--gpus", help="Physical GPU IDs; required for r3/tis/sc, defaults to the legacy mode pair for off/on"
+    )
     p.add_argument("--host-ip", required=True)
     p.add_argument("--ray-tmpdir", type=Path, help="New private cache directory; existing paths are refused")
     p = sub.add_parser("exec", help="Run one explicit command inside the recorded namespace")

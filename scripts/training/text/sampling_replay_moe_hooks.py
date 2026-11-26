@@ -29,6 +29,32 @@ def _snapshot(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().reshape(-1)[:_SAMPLE_ELEMENTS].to(device="cpu", dtype=torch.float32).clone()
 
 
+def _routing_replay_snapshot() -> dict[str, Any]:
+    """Observe native consumption for the frozen 48-layer/full-recompute
+    smoke."""
+    from relax.utils.training.routing_replay import RoutingReplay
+
+    layers = [
+        {
+            "layer": index,
+            "recorded_batches": len(replay.top_indices_list),
+            "forward_consumed": replay.forward_index,
+            "backward_consumed": replay.backward_index,
+        }
+        for index, replay in enumerate(RoutingReplay.all_routing_replays)
+    ]
+    return {
+        "expected_layers": 48,
+        "layers": layers,
+        "fully_consumed": len(layers) == 48
+        and all(
+            layer["recorded_batches"] > 0
+            and layer["forward_consumed"] == layer["backward_consumed"] == layer["recorded_batches"]
+            for layer in layers
+        ),
+    }
+
+
 def install_observer(
     model: list,
     optimizer: Any,
@@ -36,6 +62,7 @@ def install_observer(
     output: Path,
     rank: int,
     weight_decay: float,
+    routing_replay: bool = False,
 ) -> None:
     """Wrap step once and preserve its original arguments and return value."""
     if getattr(optimizer, "sampling_replay_moe_observed", False):
@@ -70,6 +97,23 @@ def install_observer(
             sampled_gradient is not None and not torch.isfinite(sampled_gradient).all()
         ):
             raise ValueError(f"MoE observer rank {rank}: non-finite sampled parameter/gradient before step")
+        routing = _routing_replay_snapshot() if routing_replay else None
+        if routing is not None and not routing["fully_consumed"]:
+            with path.open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "optimizer_step": counter,
+                            "rank": rank,
+                            "optimizer_called": False,
+                            "routing_replay": routing,
+                            "error": "native routing replay has missing or unconsumed layer batches",
+                        },
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
+            raise ValueError(f"MoE observer rank {rank}: native routing replay not fully consumed; see {path}")
         result = native_step(*step_args, **step_kwargs)
         after = _snapshot(parameter)
         delta = after - before
@@ -98,6 +142,7 @@ def install_observer(
             "before_sha256": hashlib.sha256(before.numpy().tobytes()).hexdigest(),
             "after_sha256": hashlib.sha256(after.numpy().tobytes()).hexdigest(),
             "weight_decay": weight_decay,
+            "routing_replay": routing,
         }
         # Keep machine-readable evidence even when the native optimizer rejects a step.
         # None represents unavailable/non-finite values rather than invalid JSON NaN.
@@ -128,4 +173,5 @@ def before_train(args: Namespace, rollout_id: int, step_id: int, model: list, op
         output=Path(args.dump_details),
         rank=dist.get_rank(group=dist.group.WORLD),
         weight_decay=args.weight_decay,
+        routing_replay=getattr(args, "use_rollout_routing_replay", False),
     )
