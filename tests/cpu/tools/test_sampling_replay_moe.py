@@ -191,3 +191,13 @@ def test_job_runtime_env_merges_with_real_ray_driver_environment(tmp_path):
     assert merged["env_vars"]["PYTHONPATH"] == "driver-path"
     assert merged["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] == "1"
     assert merged["env_vars"]["HF_HOME"] == str(tmp_path / "cache/hf")
+
+
+def test_native_job_metrics_require_one_real_step_and_the_frozen_batch():
+    from scripts.tools.sampling_replay_moe import metrics_from_job_log
+
+    record = "step 0: {'train/loss': 0.25, 'train/grad_norm': 0.5, 'train/step': 0, 'train/global_batch_size': 32}"
+    assert metrics_from_job_log(record)["train/loss"] == [0.25]
+    for bad in ("no metrics", record + "\n" + record, record.replace("size': 32", "size': 16")):
+        with pytest.raises(ValueError):
+            metrics_from_job_log(bad)

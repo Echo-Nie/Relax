@@ -139,3 +139,24 @@ def test_inner_namespace_rejects_wrong_ownership_or_identity(tmp_path, monkeypat
     monkeypatch.setattr(sampling_replay_isolated.os, "readlink", namespace)
     with pytest.raises(ValueError, match="namespace|PID"):
         checked_state(tmp_path, inside=True)
+
+
+def test_create_rejects_oversized_ray_socket_before_starting_cluster(tmp_path, monkeypatch):
+    monkeypatch.setattr(sampling_replay_isolated.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "check_output", lambda *a, **k: "0, 0, 0\n")
+
+    def forbidden_launch(*args, **kwargs):
+        pytest.fail("Started Ray with a socket path that cannot bind")
+
+    monkeypatch.setattr(sampling_replay_isolated.subprocess, "Popen", forbidden_launch)
+    args = argparse.Namespace(
+        instance=tmp_path / "instance",
+        mode="off",
+        gpus="0",
+        host_ip="127.0.0.1",
+        ray_tmpdir=tmp_path / ("long-cache-" * 12),
+    )
+    with pytest.raises(OSError, match="AF_UNIX path length"):
+        sampling_replay_isolated.create(args)
+    assert not args.instance.exists()
+    assert not args.ray_tmpdir.exists()

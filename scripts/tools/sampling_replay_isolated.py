@@ -144,6 +144,16 @@ def hold(instance: Path) -> None:
     os.execvpe(argv[0], argv, instance_env(config))
 
 
+def check_ray_socket_path(ray_tmpdir: Path) -> None:
+    # Linux AF_UNIX paths are limited to 107 bytes. Ray adds a timestamp,
+    # PID and dashboard module name beneath the supplied temporary directory.
+    pid_max = Path("/proc/sys/kernel/pid_max").read_text().strip()
+    session = f"session_2000-01-01_00-00-00_000000_{pid_max}"
+    path = ray_tmpdir.resolve() / session / "sockets" / "dash_MetricsHead"
+    if len(os.fsencode(path)) > 107:
+        raise OSError(f"AF_UNIX path length exceeds 107 bytes: {path}")
+
+
 def create(args: argparse.Namespace) -> None:
     if os.geteuid() != 0:
         raise ValueError("Network namespace setup requires root with CAP_SYS_ADMIN/CAP_NET_ADMIN")
@@ -155,6 +165,8 @@ def create(args: argparse.Namespace) -> None:
     if args.ray_tmpdir is not None and args.ray_tmpdir.resolve().exists():
         raise FileExistsError(f"Cache directory already exists: {args.ray_tmpdir}")
     check_gpus_idle(gpus)
+    if args.ray_tmpdir is not None:
+        check_ray_socket_path(args.ray_tmpdir)
     args.instance.mkdir(parents=True, exist_ok=False)
     if args.ray_tmpdir is None:
         ray_tmpdir = Path(tempfile.mkdtemp(prefix=f"sr-{args.mode}5678-", dir="/tmp"))

@@ -6,10 +6,12 @@ Never auto-retry.
 """
 
 import argparse
+import ast
 import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -427,6 +429,17 @@ def validate_samples(samples, originals, replay, *, cp_size=1, cp_rank=0):
     return nonzero
 
 
+def metrics_from_job_log(text):
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    rows = re.findall(r"step 0: (\{.*\})", clean)
+    if len(rows) != 1:
+        raise ValueError("Expected exactly one native train step-0 metrics record")
+    values = ast.literal_eval(rows[0])
+    if values.get("train/step") != 0 or values.get("train/global_batch_size") != 32:
+        raise ValueError("Unexpected native train step/batch budget")
+    return {key: [value] for key, value in values.items()}
+
+
 def analyze(args):
     import torch
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -476,9 +489,14 @@ def analyze(args):
         ):
             raise ValueError("Invalid rank/step or non-finite/failed optimizer update")
         updates.extend(rows)
-    tb = EventAccumulator(str(run / "tensorboard_log"), size_guidance={"scalars": 0})
-    tb.Reload()
-    metrics = {k: [e.value for e in tb.Scalars(k)] for k in tb.Tags()["scalars"]}
+    if (run / "tensorboard_log").is_dir():
+        tb = EventAccumulator(str(run / "tensorboard_log"), size_guidance={"scalars": 0})
+        tb.Reload()
+        metrics = {k: [e.value for e in tb.Scalars(k)] for k in tb.Tags()["scalars"]}
+        metrics_source = "tensorboard_log"
+    else:
+        metrics = metrics_from_job_log((run / "job.log").read_text())
+        metrics_source = "job.log native train step 0"
     if not metrics or any(not math.isfinite(x) for v in metrics.values() for x in v):
         raise ValueError("Missing/non-finite metrics")
     # Some versions place TB under the default dump directory; require actual loss evidence.
@@ -497,6 +515,7 @@ def analyze(args):
             nonzero_advantage_tokens_by_rank=all_nonzero,
             updates=updates,
             metrics=metrics,
+            metrics_source=metrics_source,
             note="Observed expert slices only; CP/TP math has separate reference tests. No additional diagnostic forward.",
         ),
     )
