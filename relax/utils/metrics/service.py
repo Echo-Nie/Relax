@@ -121,7 +121,18 @@ class MetricsService:
     (TensorBoard, W&B, ClearML) at step boundaries.
     """
 
-    def __init__(self, healthy: Any, pg: Optional[Any], config: Namespace, role: str = "metrics") -> None:
+    def __init__(
+        self,
+        healthy: Any,
+        pg: Optional[Any],
+        config: Namespace,
+        role: str = "metrics",
+        runtime_env: Optional[dict] = None,
+    ) -> None:
+        # Worker bootstrap may restore parent settings after Ray env setup.
+        # Reapply the same driver-selected environment before tracking imports.
+        if runtime_env is not None:
+            os.environ.update(runtime_env.get("env_vars", {}))
         self.config = config
         self.healthy = healthy
         self.role = role

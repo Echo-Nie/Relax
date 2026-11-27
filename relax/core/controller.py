@@ -664,6 +664,7 @@ class Controller:
             pg=None,
             config=self.config,
             role="metrics",
+            runtime_env=self.runtime_env,
         )
         serve.run(deployment, name="metrics", route_prefix="/metrics")
         logger.info("MetricsService deployed at /metrics")
