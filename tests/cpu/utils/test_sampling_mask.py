@@ -219,7 +219,8 @@ def _transfer_round_trip(ray_temp_dir):
         )
         client = tq.get_client()
         args = replay_args()
-        data = convert_samples_to_train_data(args, replay_samples())
+        samples = list(reversed(replay_samples()))
+        data = convert_samples_to_train_data(args, samples)
         client.put(data, partition_id="sampling_contract")
         received, meta = get_data_from_transfer_queue(
             args=args,
@@ -235,8 +236,13 @@ def _transfer_round_trip(ray_temp_dir):
             post_process=False,
         )
         assert meta.size == 3
-        assert received["response_lengths"] == [3, 1, 0]
-        assert_support_rows(received)
+        assert received["response_lengths"] == [0, 1, 3]
+        assert [row.tolist() for row in received["loss_masks"]] == [[], [1], [1, 1, 1]]
+        assert [row.tolist() for row in received["rollout_log_probs"]] == [s.rollout_log_probs for s in samples]
+        for field, attr in zip(SAMPLING_MASK_FIELDS, ("ids", "offsets"), strict=True):
+            assert [row.tolist() for row in received[field]] == [
+                getattr(s.rollout_sampling_mask, attr).tolist() for s in samples
+            ]
     finally:
         tq.close()
         ray.shutdown()
@@ -259,3 +265,28 @@ def test_sampling_mask_transfer_queue_reaches_training_side():
                 process.terminate()
                 process.join(timeout=10)
             process.close()
+
+
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("order", [(2, 0, 1), (0, 2, 1), (2, 2)])
+def test_empty_response_preserves_neighbor_rows(replay, order):
+    samples = [replay_samples()[i] for i in order]
+    data = convert_samples_to_train_data(replay_args(use_rollout_sampling_replay=replay), samples)
+    assert [row.tolist() for row in data["loss_masks"]] == [[1] * s.response_length for s in samples]
+    assert [row.tolist() for row in data["rollout_log_probs"]] == [s.rollout_log_probs for s in samples]
+    if replay:
+        for key, field in zip(SAMPLING_MASK_FIELDS, ("ids", "offsets"), strict=True):
+            assert [row.tolist() for row in data[key]] == [
+                getattr(s.rollout_sampling_mask, field).tolist() for s in samples
+            ]
+
+
+@pytest.mark.parametrize(
+    "index,behavior",
+    [(0, None), (1, None), (2, None), (0, []), (1, [0.0, 0.0]), (0, [-1, -2, float("nan")]), (1, [0.3]), (1, [-0.5])],
+)
+def test_replay_rejects_invalid_behavior_before_transfer(index, behavior):
+    samples = replay_samples()
+    samples[index].rollout_log_probs = behavior
+    with pytest.raises(ValueError, match="behavior"):
+        convert_samples_to_train_data(replay_args(), samples)

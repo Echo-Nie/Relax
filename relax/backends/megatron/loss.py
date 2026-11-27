@@ -573,6 +573,7 @@ def get_log_probs_and_entropy(
                 max_seq_len=max_seq_lens[sample_idx] if max_seq_lens is not None else None,
                 padded_total_length=padded_total_lengths[sample_idx] if padded_total_lengths is not None else None,
             )
+            shard_vocab_size = mpu.get_tensor_model_parallel_world_size() * logits_chunk.size(-1)
             keep_mask = sampling_replay_keep_mask(
                 rollout_sampling_mask_ids[sample_idx],
                 rollout_sampling_mask_offsets[sample_idx],
@@ -580,7 +581,7 @@ def get_log_probs_and_entropy(
                 tokens_chunk,
                 vocab_start=mpu.get_tensor_model_parallel_rank() * logits_chunk.size(-1),
                 local_vocab_size=logits_chunk.size(-1),
-                vocab_size=mpu.get_tensor_model_parallel_world_size() * logits_chunk.size(-1),
+                vocab_size=min(shard_vocab_size, getattr(args, "sampling_replay_vocab_size", shard_vocab_size)),
             )
         return calculate_log_probs_and_entropy(
             logits_chunk,
@@ -620,12 +621,19 @@ def get_log_probs_and_entropy(
             topk_k=resolved_topk_k,
         )
         if use_rollout_sampling_replay:
-            # Preserve SC candidate scoring and entropy; replay only sampled actor logprob.
-            res["log_probs"] = []
+            # Candidate and sampled scores must describe the same policy, including
+            # partial SC heads. For candidates in S, log p(c|S) - log p(y|S)
+            # equals log p(c) - log p(y). Padding is masked by the behavior head.
             for sample_idx, (raw_logits, tokens_chunk) in enumerate(response_views):
                 scaled_logits = raw_logits.float() / args.rollout_temperature
                 log_prob, _ = score_response(sample_idx, scaled_logits, tokens_chunk, include_entropy=False)
-                res["log_probs"].append(log_prob.squeeze(-1))
+                sampled = log_prob.squeeze(-1)
+                if gather_topk_token_ids is not None:
+                    head = res["topk_log_probs"][sample_idx]
+                    res["topk_log_probs"][sample_idx] = (head - res["log_probs"][sample_idx][:, None]) + sampled[
+                        :, None
+                    ]
+                res["log_probs"][sample_idx] = sampled
     elif lm_head_forward is not None:
         res = {"log_probs": []}
         if gather_topk_token_ids is not None:

@@ -58,6 +58,10 @@ def sampling_replay_keep_mask(
     temporary bool mask move to the logits device. Validate targets BEFORE the
     logprob primitive, which otherwise implicitly retains absent targets.
     """
+    # All CP/TP ranks see the original CPU CSR. Reject invalid IDs before sharding
+    # can silently discard a candidate or assign it to a padded output column.
+    if (ids >= vocab_size).any():
+        raise ValueError("rollout sampling support contains an ID outside the actor vocabulary")
     lengths = offsets[response_indices + 1] - offsets[response_indices]
     rows = torch.repeat_interleave(torch.arange(len(response_indices), device="cpu"), lengths)
     starts = offsets[response_indices] - lengths.cumsum(0) + lengths

@@ -546,9 +546,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
+        text_config = getattr(self.hf_config, "text_config", self.hf_config)
         if self.args.advantage_estimator == "score_centering":
-            text_config = getattr(self.hf_config, "text_config", self.hf_config)
             self.args.score_centering_vocab_size = text_config.vocab_size
+        if getattr(self.args, "use_rollout_sampling_replay", False):
+            self.args.sampling_replay_vocab_size = text_config.vocab_size
         # Hybrid switches live model roles; rollout pushes must read the actor snapshot.
         skip_weight_management = should_skip_sft_weight_management(
             self.args,

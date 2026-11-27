@@ -437,6 +437,16 @@ class MsgNode:
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
     sampling_mask_delta: RolloutSamplingMask | None = None
 
+    def same_candidates(self, other: MsgNode) -> bool:
+        if not np.array_equal(self.topk_token_ids_delta, other.topk_token_ids_delta):
+            return False
+        if not np.array_equal(self.topk_support_complete_delta, other.topk_support_complete_delta):
+            return False
+        left, right = self.topk_logprob_delta, other.topk_logprob_delta
+        if left is None or right is None:
+            return left is right
+        return left.shape == right.shape and np.allclose(left, right, rtol=1e-5, atol=1e-6)
+
 
 @dataclass(eq=False)
 class InflightRequest:
@@ -622,14 +632,21 @@ class SessionForest:
         if existing is not None:
             if existing.kind != node.kind:
                 raise ValueError(f"State hash collision with mismatched kinds: {existing.kind} vs {node.kind}")
-            if self.use_rollout_sampling_replay and node.kind == "resp":
+            has_candidates = existing.topk_token_ids_delta is not None or node.topk_token_ids_delta is not None
+            if node.kind == "resp" and (self.use_rollout_sampling_replay or has_candidates):
                 # Canonical messages identify content, not a sampling event.
                 # Keep that identity only when reusing the node preserves q.
                 old_mask, new_mask = existing.sampling_mask_delta, node.sampling_mask_delta
                 if (
                     existing.train_token_delta != node.train_token_delta
-                    or not torch.equal(old_mask.ids, new_mask.ids)
-                    or not torch.equal(old_mask.offsets, new_mask.offsets)
+                    or (
+                        self.use_rollout_sampling_replay
+                        and (
+                            not torch.equal(old_mask.ids, new_mask.ids)
+                            or not torch.equal(old_mask.offsets, new_mask.offsets)
+                        )
+                    )
+                    or (has_candidates and not existing.same_candidates(node))
                     or any(
                         not math.isclose(old, new, rel_tol=1e-5, abs_tol=1e-6)
                         for old, new in zip(existing.logprob_delta, node.logprob_delta, strict=True)
@@ -637,7 +654,7 @@ class SessionForest:
                 ):
                     raise ValueError(
                         f"sampling replay metadata conflict for canonical response {node.state_hash}: "
-                        "tokens, sampling support or behavior logprobs differ"
+                        "tokens, sampling support, behavior logprobs or score-centering candidates differ"
                     )
             return existing
 

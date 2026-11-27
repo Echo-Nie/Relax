@@ -408,3 +408,13 @@ def validate_score_centering_sample(sample: Sample, k: int, *, vocab_size: int |
         vocab_size=vocab_size,
         support_complete=support_complete,
     )
+    mask = sample.rollout_sampling_mask
+    if mask is not None:
+        # Combined SC/SR may also receive serialized samples. Candidate scores
+        # can be conditioned on this CSR only when the head is a subset of it.
+        offsets, support_ids = mask.offsets.numpy(), mask.ids.numpy()
+        for i in np.flatnonzero(active):
+            support = set(support_ids[offsets[i] : offsets[i + 1]])
+            head = set(ids[i, ids[i] >= 0])
+            if not head <= support or (support_complete is not None and support_complete[i] != (head == support)):
+                raise ValueError(f"{context}, position {i}: candidate head disagrees with replay support")

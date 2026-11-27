@@ -197,24 +197,30 @@ def test_sampling_replay_forward_only_actor_gate_and_microbatch_wiring(monkeypat
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_sampling_replay_does_not_change_score_centering_candidates(dtype):
+def test_sampling_replay_conditions_score_centering_candidates_and_preserves_entropy(dtype):
     args = scoring_args(advantage_estimator="score_centering", score_centering_vocab_size=8)
     logits = torch.arange(48).reshape(1, 6, 8).float().sin().to(dtype).requires_grad_()
-    candidates = [torch.tensor([[3, 1], [7, 4], [2, 6], [5, 1]])]
+    candidates = [torch.tensor([[3, 1], [7, 4], [2, -1], [5, 1]])]
     baseline = score(
         logits, args, use_rollout_sampling_replay=False, gather_topk_token_ids=candidates, with_entropy=True
     )
     replay = score(logits, args, gather_topk_token_ids=candidates, with_entropy=True)
-    torch.testing.assert_close(replay["topk_log_probs"][0], baseline["topk_log_probs"][0], rtol=0, atol=0)
+    expected_head = torch.cat(
+        [
+            (logits[0, 1 + t, row].float() / args.rollout_temperature).log_softmax(0)[
+                [row.index(i) for i in head if i >= 0]
+            ]
+            for t, (row, head) in enumerate(zip(ROWS, candidates[0].tolist(), strict=True))
+        ]
+    )
+    head = replay["topk_log_probs"][0][candidates[0] >= 0]
+    torch.testing.assert_close(head, expected_head, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(replay["entropy"][0], baseline["entropy"][0], rtol=0, atol=0)
-    candidate_grad = torch.autograd.grad(replay["topk_log_probs"][0].sum(), logits, retain_graph=True)[0]
-    baseline_grad = torch.autograd.grad(baseline["topk_log_probs"][0].sum(), logits, retain_graph=True)[0]
-    torch.testing.assert_close(candidate_grad, baseline_grad, rtol=0, atol=0)
     expected = independent_reference(logits, ROWS, 0.7)
     torch.testing.assert_close(replay["log_probs"][0], expected, atol=1e-6, rtol=1e-6)
-    actual_grad = torch.autograd.grad(replay["log_probs"][0].sum(), logits, retain_graph=True)[0]
-    expected_grad = torch.autograd.grad(expected.sum(), logits)[0]
-    torch.testing.assert_close(actual_grad, expected_grad, atol=1e-6, rtol=1e-6)
+    actual_grad = torch.autograd.grad(head.sum() + replay["log_probs"][0].sum(), logits)[0]
+    expected_grad = torch.autograd.grad(expected_head.sum() + expected.sum(), logits)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, rtol=0.01 if dtype == torch.bfloat16 else 1e-6, atol=1e-6)
 
 
 def test_sampling_replay_policy_loss_uses_support_gradient():
@@ -321,3 +327,73 @@ def test_sampling_replay_rollout_metrics_exclude_csr(monkeypatch):
     )
     assert captured["rewards"] == 2.0
     assert not set(SAMPLING_MASK_FIELDS) & captured.keys()
+
+
+@pytest.mark.parametrize("model_vocab,bad_id", [(8, 8), (6, 6)])
+def test_replay_rejects_out_of_vocab_non_sampled_candidate(model_vocab, bad_id):
+    args = scoring_args(sampling_replay_vocab_size=model_vocab)
+    logits = torch.zeros(1, 2, 8)
+    batch = dict(unconcat_tokens=[torch.tensor([0, 3])], total_lengths=[2], response_lengths=[1])
+    valid = score(logits, args, rows=[[3, model_vocab - 1]], **batch)
+    torch.testing.assert_close(valid["log_probs"][0], torch.tensor([0.5]).log())
+    with pytest.raises(ValueError, match="support.*vocabulary"):
+        score(logits, args, rows=[[3, bad_id]], **batch)
+
+
+@pytest.mark.parametrize("mode", ["none", "tis", "mis"])
+@pytest.mark.parametrize(
+    "row,head,q",
+    [
+        ([0], [0], [1.0]),
+        ([0, 2], [0, 2], [0.4, 0.6]),
+        ([0, 1, 2], [2], [0.3, 0.3, 0.4]),
+    ],
+)
+def test_sc_replay_final_policy_gradient_matches_restricted_model(mode, row, head, q):
+    # Train a reference SC policy whose entire vocabulary is exactly the saved support.
+    args = scoring_args(
+        advantage_estimator="score_centering",
+        rollout_temperature=1.0,
+        use_opsm=False,
+        use_tis=False,
+        get_mismatch_metrics=False,
+        use_kl_loss=False,
+        use_opd=False,
+        use_rollout_logprobs=True,
+        score_centering_is=mode,
+        score_centering_tis_clip=2.0,
+        score_centering_mis_low=0.5,
+        score_centering_mis_high=5.0,
+    )
+    logits = torch.tensor([[[1.0, 0.0, -1.0, 2.0], [0.0] * 4]], requires_grad=True)
+    ref = logits.detach().clone().requires_grad_()
+    mask = RolloutSamplingMask.from_rows([row])
+    batch = {
+        "advantages": [torch.ones(1)],
+        "total_lengths": [2],
+        "response_lengths": [1],
+        "unconcat_tokens": [torch.tensor([0, 0])],
+        "loss_masks": [torch.ones(1)],
+        "rollout_sampling_mask_ids": [mask.ids],
+        "rollout_sampling_mask_offsets": [mask.offsets],
+        "rollout_log_probs": [torch.tensor([q[0]]).log()],
+        "rollout_topk_token_ids": [torch.tensor([head])],
+        "rollout_topk_log_probs": [torch.tensor([[q[row.index(i)] for i in head]]).log()],
+        "rollout_topk_support_complete": [torch.tensor([len(row) == len(head)])],
+    }
+    args.score_centering_vocab_size = logits.size(-1)
+    actual, _ = loss.policy_loss_function(args, batch, logits, torch.mean)
+    args.use_rollout_sampling_replay = False
+    args.score_centering_vocab_size = len(row)
+    expected, _ = loss.policy_loss_function(
+        args,
+        {**batch, "rollout_topk_token_ids": [torch.tensor([[row.index(i) for i in head]])]},
+        ref[..., row].contiguous(),
+        torch.mean,
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(logits.grad, ref.grad, atol=1e-6, rtol=1e-6)
+    if len(row) == 1:
+        assert logits.grad.count_nonzero() == 0

@@ -570,7 +570,9 @@ def test_sampling_replay_agentic_policy_loss_masks_observations():
         assert torch.count_nonzero(logits.grad[0, 3:5]) == 0
 
 
-def canonical_response(forest, parent, *, tokens=(3, 7), rows=((3, 1), (2, 7, 0)), logprobs=(-0.5, -1.0)):
+def canonical_response(
+    forest, parent, *, tokens=(3, 7), rows=((3, 1), (2, 7, 0)), logprobs=(-0.5, -1.0), **candidates
+):
     return forest.append_resp(
         parent_state_hash=parent.state_hash,
         rollout_id=0,
@@ -580,6 +582,7 @@ def canonical_response(forest, parent, *, tokens=(3, 7), rows=((3, 1), (2, 7, 0)
         logprob_delta=list(logprobs),
         sampling_mask_delta=RolloutSamplingMask.from_rows(rows),
         export_metadata_patch={"marker": list(logprobs)},
+        **candidates,
     )
 
 
@@ -714,3 +717,36 @@ async def test_sampling_replay_agentic_observation_compiler_keeps_template_token
     assert sample.rollout_log_probs == [-0.5, 0.0, *([0.0] * len(expected_obs)), -0.7]
     assert sample.rollout_sampling_mask.ids.tolist() == [3, 1, 7, *expected_obs, 2, 5]
     assert sample.response_length == len(sample.rollout_sampling_mask) == len(suffix)
+
+
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("change", ["probability", "ids", "coverage", "missing", "close"])
+def test_forest_candidate_identity_is_checked_before_reuse(replay, change):
+    forest, prompt = forest_with_prompt(replay=replay)
+    candidates = dict(
+        topk_token_ids_delta=np.array([[3, 1, 2]], dtype=np.int32),
+        topk_logprob_delta=np.log([[0.5, 0.3, 0.2]]),
+        topk_support_complete_delta=np.array([True]),
+    )
+    event = dict(tokens=(3,), rows=((3, 1, 2),), logprobs=(math.log(0.5),))
+    first = canonical_response(forest, prompt, **event, **candidates)
+    incoming = {key: value.copy() for key, value in candidates.items()}
+    if change == "close":
+        incoming["topk_logprob_delta"][0, 1] += 1e-7
+        assert canonical_response(forest, prompt, **event, **incoming) is first
+        return
+    if change == "probability":
+        incoming["topk_logprob_delta"] = np.log([[0.5, 0.35, 0.15]])
+    elif change == "ids":
+        incoming["topk_token_ids_delta"][0] = [3, 2, 1]
+    elif change == "coverage":
+        incoming["topk_support_complete_delta"][0] = False
+    else:
+        incoming = {}
+    leaves = forest.export_leaf_hashes()
+    with pytest.raises(ValueError, match="metadata conflict"):
+        canonical_response(forest, prompt, **event, **incoming)
+    assert forest.export_leaf_hashes() == leaves
+    assert forest.nodes_by_hash[first.state_hash] is first
+    sample = forest.build_sample(leaf_state_hash=first.state_hash, tokenizer=Tokenizer())
+    np.testing.assert_allclose(sample.rollout_topk_log_probs, candidates["topk_logprob_delta"])

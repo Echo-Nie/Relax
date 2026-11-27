@@ -351,3 +351,39 @@ def test_countdown_evaluation_does_not_require_training_probability_metadata(gen
     assert sample.tokens == [0, 3, 1]
     assert sample.response == "answer" and sample.response_length == 2
     assert sample.rollout_sampling_mask is None and sample.rollout_log_probs == []
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_zero_budget_sc_can_enter_training_batch(generate_boundary, replay):
+    from relax.utils.score_centering import validate_score_centering_sample
+
+    args = args_for_replay(
+        advantage_estimator="score_centering",
+        use_rollout_sampling_replay=replay,
+        rollout_top_logprobs_num=2,
+        score_centering_vocab_size=4,
+    )
+    sample = generate(Sample(prompt="p"), args, max_new_tokens=0)
+    validate_score_centering_sample(sample, 2, vocab_size=4)
+    assert sample.tokens == [0] and sample.rollout_log_probs == []
+    assert not generate_boundary[0]
+
+
+@pytest.mark.parametrize("corrupt", ["foreign_candidate", "coverage"])
+def test_sc_replay_rejects_inconsistent_restored_head(corrupt):
+    import numpy as np
+
+    from relax.utils.sampling_mask import RolloutSamplingMask
+    from relax.utils.score_centering import validate_score_centering_sample
+
+    sample = Sample(
+        tokens=[2, 0],
+        response_length=1,
+        rollout_log_probs=[math.log(0.5)],
+        rollout_sampling_mask=RolloutSamplingMask.from_rows([[0, 1]]),
+        rollout_topk_token_ids=np.array([[0, 2 if corrupt == "foreign_candidate" else 1]], dtype=np.int32),
+        rollout_topk_log_probs=np.log(np.array([[0.5, 0.5]], dtype=np.float32)),
+        rollout_topk_support_complete=np.array([corrupt != "coverage"]),
+    )
+    with pytest.raises(ValueError, match="candidate head disagrees with replay support"):
+        validate_score_centering_sample(sample, 2, vocab_size=3)

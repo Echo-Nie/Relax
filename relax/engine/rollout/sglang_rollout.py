@@ -451,11 +451,18 @@ async def generate(
         f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
     )
     if sampling_params["max_new_tokens"] == 0:
-        if replay_enabled:
+        sc_enabled = not evaluation and score_centering_enabled(args)
+        if replay_enabled or sc_enabled:
             sample.tokens = sample.tokens or processor_prompt_ids
             sample.rollout_tokens = sample.rollout_tokens or tokenizer_prompt_ids
-            sample.rollout_sampling_mask = prefix_mask
             sample.rollout_log_probs = sample.rollout_log_probs or []
+        if replay_enabled:
+            sample.rollout_sampling_mask = prefix_mask
+        if sc_enabled and sample.response_length == 0:
+            shape = (0, args.rollout_top_logprobs_num)
+            sample.rollout_topk_token_ids = np.empty(shape, dtype=np.int32)
+            sample.rollout_topk_log_probs = np.empty(shape, dtype=np.float32)
+            sample.rollout_topk_support_complete = np.empty(0, dtype=bool)
         sample.status = Sample.Status.TRUNCATED
         return sample
 

@@ -200,6 +200,12 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
                 raise ValueError(f"Sample {sample.index}: missing rollout_sampling_mask with sampling replay enabled")
             if len(mask) != sample.response_length:
                 raise ValueError(f"Sample {sample.index}: sampling mask length must match response_length")
+            behavior = np.asarray(sample.rollout_log_probs, dtype=np.float64)
+            if behavior.shape != (len(mask),) or not np.isfinite(behavior).all() or (behavior > 1e-6).any():
+                raise ValueError(f"Sample {sample.index}: expected one finite behavior logprob per response token")
+            singleton = np.diff(mask.offsets.numpy()) == 1
+            if not np.allclose(np.exp(behavior[singleton]), 1.0, rtol=1e-5, atol=1e-5):
+                raise ValueError(f"Sample {sample.index}: singleton support must have unit behavior probability")
         train_data["rollout_sampling_mask_ids"] = [sample.rollout_sampling_mask.ids for sample in samples]
         train_data["rollout_sampling_mask_offsets"] = [sample.rollout_sampling_mask.offsets for sample in samples]
 
@@ -363,8 +369,8 @@ def dict_to_tensordict(
         return TensorDict({}, batch_size=0 if batch_size is None else batch_size, device=device)
 
     def _nesting_depth(x):
-        if isinstance(x, list) and x:
-            return 1 + _nesting_depth(x[0])
+        if isinstance(x, list):
+            return 1 + (_nesting_depth(x[0]) if x else 0)
         return 0
 
     def _scalar_dtype(sample) -> Optional[torch.dtype]:
@@ -447,7 +453,7 @@ def dict_to_tensordict(
             continue
 
         depth = _nesting_depth(value)
-        if depth == 0:  # empty list []
+        if not value:
             tensor = torch.empty(0)
         elif depth == 1:
             if key in MULTIMODAL_PAYLOAD_FIELDS:
