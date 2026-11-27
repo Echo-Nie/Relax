@@ -260,6 +260,19 @@ def argv(a):
         "--custom-rollout-log-function-path": "scripts.training.text.sampling_replay_countdown_hooks.rollout_log",
         "--custom-eval-rollout-log-function-path": "scripts.training.text.sampling_replay_countdown_hooks.eval_log",
     }
+    joint = a.stage == "sc-sr-smoke"
+    if joint:
+        if a.mode != "sc":
+            raise ValueError("The combined SC/SR smoke requires mode sc")
+        opts.update(
+            {
+                "--num-rollout": 1,
+                "--rollout-batch-size": 8,
+                "--global-batch-size": 64,
+                "--custom-megatron-before-train-step-hook-path": "scripts.training.text.sampling_replay_countdown_hooks.before_joint_smoke",
+            }
+        )
+        del opts["--eval-interval"]
     flags = [
         "--colocate",
         "--bf16",
@@ -281,11 +294,16 @@ def argv(a):
         *model,
         *flags,
         *[str(v) for k, value in opts.items() for v in (k, value)],
-        "--eval-prompt-data",
-        "countdown-dev",
-        str(a.root / "data" / ("countdown-dev.jsonl" if a.stage == "formal" else "dev-smoke.jsonl")),
     ]
-    if a.mode == "on":
+    if not joint:
+        result.extend(
+            [
+                "--eval-prompt-data",
+                "countdown-dev",
+                str(a.root / "data" / ("countdown-dev.jsonl" if a.stage == "formal" else "dev-smoke.jsonl")),
+            ]
+        )
+    if a.mode == "on" or joint:
         result.append("--use-rollout-sampling-replay")
     if a.mode == "tis":
         result.extend(["--use-tis", "--tis-clip-low", "0", "--tis-clip", "2"])
@@ -428,7 +446,8 @@ def analyze(a):
     }
     stop = base.read(run / "results/stop.json") if (run / "results/stop.json").exists() else None
     text = (run / "job.log").read_text()
-    budget = 100 if a.stage == "formal" else 2
+    joint = a.stage == "sc-sr-smoke"
+    budget = 1 if joint else (100 if a.stage == "formal" else 2)
     if stop:
         kind = stop["kind"]
     elif "CUDA out of memory" in text:
@@ -449,7 +468,8 @@ def analyze(a):
     )
     base.write(run / "analysis.json", result)
     if kind == "budget_completed":
-        expected = [0, *range(10 if a.stage == "formal" else 2, budget + 1, 10 if a.stage == "formal" else 2)]
+        interval = 10 if a.stage == "formal" else 2
+        expected = [] if joint else [0, *range(interval, budget + 1, interval)]
         if (
             len(train) != budget
             or any(len(v) != budget for v in updates.values())
@@ -457,7 +477,9 @@ def analyze(a):
         ):
             raise ValueError("Missing updates/evals; Job SUCCEEDED is insufficient")
         for row in train:
-            if len(rows(run / f"results/train/{row['completed_updates_before_batch']}.jsonl")) != 512:
+            if len(rows(run / f"results/train/{row['completed_updates_before_batch']}.jsonl")) != (
+                64 if joint else 512
+            ):
                 raise ValueError("Incomplete training responses")
         for row in evaluations:
             if len(rows(run / f"results/eval/{row['native_rollout_id']}.jsonl")) != row["samples"]:
@@ -471,9 +493,22 @@ def analyze(a):
             raise ValueError("Missing/ambiguous ClearML Task")
         t = Task.get_task(task_id=ids.pop())
         scalars = t.get_reported_scalars()
-        series = scalars.get("audit_eval", {}).get("accuracy", {})
-        if series.get("x") != expected or series.get("y") != [e["accuracy"] for e in evaluations]:
-            raise ValueError("ClearML eval step/value mismatch")
+        if joint:
+            gradient = [row for r in range(8) for row in rows(run / f"token-grad-rank{r}.jsonl")]
+            if not (
+                train[0]["mixed_reward_group_fraction"] > 0
+                and all(v[0]["sampled_gradient_nonzero"] and v[0]["changed_elements"] for v in updates.values())
+                and sum(row["single_count"] for row in gradient) > 0
+                and max(row["single_max"] for row in gradient) == 0
+                and sum(row["multi_nonzero"] for row in gradient) > 0
+            ):
+                raise ValueError(
+                    "Joint smoke requires mixed rewards, singleton zero gradient, non-singleton gradient and changed weights"
+                )
+        else:
+            series = scalars.get("audit_eval", {}).get("accuracy", {})
+            if series.get("x") != expected or series.get("y") != [e["accuracy"] for e in evaluations]:
+                raise ValueError("ClearML eval step/value mismatch")
         result.update(
             task_id=t.id,
             url=t.get_output_log_web_page(),
@@ -636,7 +671,7 @@ def main():
             c.add_argument("--gpu", type=int, required=True)
         else:
             c.add_argument("--mode", choices=ARMS, required=True)
-            c.add_argument("--stage", choices=("formal", "smoke"), default="formal")
+            c.add_argument("--stage", choices=("formal", "smoke", "sc-sr-smoke"), default="formal")
             if cmd == "start":
                 c.add_argument("--ray-tmpdir", type=Path, required=True)
             elif cmd not in ("argv",):

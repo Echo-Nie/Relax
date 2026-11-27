@@ -171,3 +171,57 @@ def before_train(args, rollout_id, step_id, model, optimizer, scheduler):
         pattern=re.compile(r"decoder\.layers\.0\.mlp\.linear_fc2\.weight$"),
         observation_scope="first 65536 elements of layer0 dense fc2; DP replicas, not independent expert shards",
     )
+
+
+def before_joint_smoke(args, rollout_id, step_id, model, optimizer, scheduler):
+    """Observe the actual one-update SC/SR backward without replacing its loss
+    or gradient."""
+    import torch
+    import torch.distributed as dist
+
+    from relax.backends.megatron import model as backend
+
+    before_train(args, rollout_id, step_id, model, optimizer, scheduler)
+    if (args.tensor_model_parallel_size, args.context_parallel_size, args.qkv_format) != (1, 1, "thd"):
+        raise ValueError("The Countdown gradient probe expects unsharded packed logits")
+    original = backend.loss_function
+    path = Path(args.rollout_result_dir).parent / f"token-grad-rank{dist.get_rank(group=dist.group.WORLD)}.jsonl"
+
+    def observed(args, batch, num_microbatches, logits, **kwargs):
+        def record(grad):
+            start = 0
+            maxima, active, singleton = [], [], []
+            for total, length, offsets, adv, mask in zip(
+                batch["total_lengths"],
+                batch["response_lengths"],
+                batch["rollout_sampling_mask_offsets"],
+                batch["advantages"],
+                batch["loss_masks"],
+                strict=True,
+            ):
+                start += total
+                predictors = grad[0, start - length - 1 : start - 1]
+                maxima.append(torch.linalg.vector_norm(predictors, ord=float("inf"), dim=-1))
+                active.append((adv.to(grad.device) != 0) & mask.to(grad.device).bool())
+                singleton.append(offsets.diff().to(grad.device) == 1)
+            norms, active, singleton = map(torch.cat, (maxima, active, singleton))
+            if not torch.isfinite(norms).all():
+                raise ValueError("Nonfinite Countdown logits gradient")
+            single = active & singleton
+            multi = active & ~singleton
+            append(
+                path,
+                dict(
+                    tokens=norms.numel(),
+                    single_count=int(single.sum()),
+                    multi_count=int(multi.sum()),
+                    single_max=float(norms[single].max()) if single.any() else 0.0,
+                    multi_nonzero=int((multi & (norms != 0)).sum()),
+                    multi_max=float(norms[multi].max()) if multi.any() else 0.0,
+                ),
+            )
+
+        logits.register_hook(record)
+        return original(args, batch, num_microbatches, logits, **kwargs)
+
+    backend.loss_function = observed
