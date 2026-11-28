@@ -41,8 +41,7 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
     """Request probabilities of the actual per-call sampler, without changing
     it.
 
-    Request per-candidate behavior logprobs when the PyTorch sampler is known
-    to be in use. Older servers ignore the mode and return the sampled logprob.
+    Use native candidates when the complete support fits the training head.
     """
     if not score_centering_enabled(args):
         return None
@@ -92,7 +91,6 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
         )
     payload["sampling_params"] = sampling
     payload["return_logprob"] = True
-    payload["top_logprobs_num"] = k
     payload.pop("sampling_logprobs_mode", None)
     if filtered:
         payload["return_sampling_mask"] = True
@@ -104,6 +102,10 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
             or getattr(args, "rollout_engine_class_path", None)
         ):
             payload["sampling_logprobs_mode"] = "support"
+            if int(sampling["top_k"]) <= k:
+                payload.pop("top_logprobs_num", None)
+                return "native_support"
+    payload["top_logprobs_num"] = k
     return "support" if filtered else "selected"
 
 
@@ -174,6 +176,58 @@ def _validate_rows(
         )
 
 
+def _native_candidates(
+    meta_info: Mapping[str, Any], tokens: list[int], k: int, vocab_size: int | None
+) -> tuple[list[float], np.ndarray, np.ndarray, np.ndarray]:
+    """Fill the existing fixed-width training head directly from SGLang's JSON
+    rows."""
+    n = len(tokens)
+    supports = meta_info.get("output_token_sampling_mask", [])
+    probabilities = meta_info.get("output_token_sampling_logprobs", [])
+    if (
+        not isinstance(supports, list)
+        or not isinstance(probabilities, list)
+        or len(supports) != n
+        or len(probabilities) != n
+    ):
+        raise ValueError("Score Centering requires one native support and probability row per generated token")
+    ids = np.full((n, k), -1, dtype=np.int32)
+    logprobs = np.full((n, k), -np.inf, dtype=np.float32)
+    sampled = []
+    for position, (token, support, q) in enumerate(zip(tokens, supports, probabilities, strict=True)):
+        if (
+            not isinstance(support, list)
+            or not 0 < len(support) <= k
+            or any(type(i) is not int or not 0 <= i <= 0x7FFFFFFF for i in support)
+        ):
+            raise ValueError(f"Score Centering position {position}: invalid native support IDs")
+        if not isinstance(q, list) or len(q) != len(support) or any(type(v) not in (int, float) for v in q):
+            raise ValueError(f"Score Centering position {position}: expected one behavior log-q per support ID")
+        try:
+            selected = q[support.index(token)]
+        except ValueError as error:
+            raise ValueError(
+                f"Score Centering position {position}: sampled token is absent from sampling support"
+            ) from error
+        if len(support) == 1 and not math.isclose(selected, 0.0, abs_tol=_PROBABILITY_TOLERANCE):
+            raise ValueError(f"Score Centering position {position}: singleton support must have probability 1")
+        sampled.append(float(selected))
+        ids[position, : len(support)] = support
+        logprobs[position, : len(support)] = q
+    complete = np.ones(n, dtype=bool)
+    _validate_rows(
+        np.asarray(tokens),
+        np.asarray(sampled),
+        ids,
+        logprobs,
+        complete,
+        context="Score Centering native support",
+        vocab_size=vocab_size,
+        support_complete=complete,
+    )
+    return sampled, ids, logprobs, complete
+
+
 def parse_score_centering_response(
     meta_info: Mapping[str, Any],
     k: int,
@@ -208,6 +262,10 @@ def parse_score_centering_response(
         sampled.append(float(row[0]))
     if expected_tokens is not None and tokens != list(expected_tokens):
         raise ValueError("Score Centering output_token_logprobs token IDs do not match generated output IDs")
+    if sampling_mode == "native_support":
+        sampled, ids, logprobs, complete = _native_candidates(meta_info, tokens, k, vocab_size)
+        result = tokens, sampled, ids, logprobs
+        return (*result, complete) if return_support_complete else result
     n = len(tokens)
     ids = np.full((n, k), -1, dtype=np.int32)
     logprobs = np.full((n, k), -np.inf, dtype=np.float32)

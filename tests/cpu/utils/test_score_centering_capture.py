@@ -282,8 +282,81 @@ def test_score_centering_capture_rejects_top_p_with_batch_dependent_support(back
 @pytest.mark.parametrize("min_p", [0.0, 0.1])
 def test_score_centering_capture_top_k_min_p_without_top_p_is_batch_independent(backend, min_p):
     payload = {"sampling_params": {"top_k": 2, "top_p": 1.0, "min_p": min_p}}
-    assert configure_score_centering_request(_args(sglang_sampling_backend=backend), payload) == "support"
+    mode = configure_score_centering_request(_args(sglang_sampling_backend=backend), payload)
+    assert mode == ("native_support" if backend == "pytorch" else "support")
     assert payload.get("sampling_logprobs_mode") == ("support" if backend == "pytorch" else None)
+
+
+def _native_response():
+    return {
+        "output_token_logprobs": [[math.log(0.4), 3], [math.log(0.7), 2]],
+        "output_token_sampling_mask": [[1, 3], [2]],
+        "output_token_sampling_logprobs": [[math.log(0.45), math.log(0.55)], [0.0]],
+    }
+
+
+@pytest.mark.parametrize("dtype_name,tolerance", [("float32", 1e-6), ("float64", 1e-14)])
+def test_native_candidates_preserve_complete_head_loss_and_logits_gradient(dtype_name, tolerance):
+    import torch
+
+    from relax.algorithms.score_centering import compute_score_centering_loss
+
+    meta = _native_response()
+    payload = {"sampling_params": {"top_p": 0.95, "top_k": 3}, "top_logprobs_num": 128}
+    mode = configure_score_centering_request(
+        _args(sglang_sampling_backend="pytorch", rollout_top_logprobs_num=128), payload
+    )
+    assert mode == "native_support" and "top_logprobs_num" not in payload
+    assert payload["return_sampling_mask"] and payload["sampling_logprobs_mode"] == "support"
+    actual = parse_score_centering_response(
+        meta, 128, sampling_mode=mode, expected_tokens=[3, 2], return_support_complete=True
+    )
+    # Complete legacy head, with the native pair in reverse order and a tied singleton outside the head.
+    filler = [[math.log(0.0001), i] for i in range(4, 132)]
+    old = dict(meta, output_top_logprobs=[[[math.log(0.4), 3], [math.log(0.3), 1], *filler[:126]], filler])
+    reference = parse_score_centering_response(old, 128, sampling_mode="support", return_support_complete=True)
+    np.testing.assert_array_equal(actual[2][:, :2], [[1, 3], [2, -1]])
+    np.testing.assert_array_equal(actual[4], [True, True])
+    assert actual[1] == pytest.approx([math.log(0.55), 0.0])
+    dtype = getattr(torch, dtype_name)
+
+    def score(parsed):
+        tokens, selected, ids, q, complete = parsed
+        logits = torch.linspace(-1, 1, 264, dtype=dtype).reshape(2, 132).requires_grad_()
+        logp = logits.log_softmax(-1)
+        loss, _ = compute_score_centering_loss(
+            log_probs=logp[torch.arange(2), tokens],
+            advantages=torch.tensor([0.8, -1.2], dtype=dtype),
+            rollout_log_probs=torch.tensor(selected, dtype=dtype),
+            train_topk_log_probs=logp.gather(1, torch.from_numpy(ids).long().clamp_min(0)),
+            rollout_topk_log_probs=torch.from_numpy(q).to(dtype),
+            support_complete=torch.from_numpy(complete),
+            loss_mask=torch.ones(2, dtype=dtype),
+        )
+        return loss, torch.autograd.grad(loss.sum(), logits)[0]
+
+    for got, expected in zip(score(actual), score(reference), strict=True):
+        torch.testing.assert_close(got, expected, atol=tolerance, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("output_token_sampling_logprobs", None),
+        ("output_token_sampling_logprobs", [[0.0], [0.0]]),
+        ("output_token_sampling_logprobs", [[-1.0, -1.0], [0.0]]),
+        ("output_token_sampling_mask", [[3, 3], [2]]),
+        ("output_token_sampling_mask", [[1, 4], [2]]),
+    ],
+)
+def test_native_candidates_reject_incomplete_response(field, value):
+    meta = _native_response()
+    if value is None:
+        del meta[field]
+    else:
+        meta[field] = value
+    with pytest.raises(ValueError, match="Score Centering"):
+        parse_score_centering_response(meta, 128, sampling_mode="native_support")
 
 
 @pytest.mark.parametrize(
