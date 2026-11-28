@@ -397,6 +397,7 @@ def test_score_centering_capture_request_preserves_penalties_and_checks_temperat
         (_args(sglang_speculative_algorithm="EAGLE"), {}, "per-accepted-token"),
         (_args(sglang_rl_on_policy_target="fsdp"), {}, "rounded BF16"),
         (_args(), {"top_p": 0.9}, "finite top_k"),
+        (_args(sglang_sampling_backend="pytorch"), {"top_p": 0.95, "top_k": -1}, "finite top_k"),
         (_args(sglang_sampling_backend="ascend"), {"top_k": 2}, "ascend"),
     ],
 )

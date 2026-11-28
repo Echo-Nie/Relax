@@ -73,8 +73,9 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
             "SGLang v0.5.17 does not return per-accepted-token sampling support probabilities for speculative "
             "decoding; Score Centering requires aligned behavior q"
         )
-    filtered = float(sampling["top_p"]) < 1 or int(sampling["top_k"]) > 0 or float(sampling["min_p"]) > 0
-    if filtered and int(sampling["top_k"]) <= 0:
+    top_k = int(sampling["top_k"])
+    filtered = float(sampling["top_p"]) < 1 or top_k > 0 or float(sampling["min_p"]) > 0
+    if filtered and top_k <= 0:
         raise ValueError(
             "SGLang return_sampling_mask requires finite top_k to return behavior q for top-p/min-p filtering"
         )
@@ -102,7 +103,7 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
             or getattr(args, "rollout_engine_class_path", None)
         ):
             payload["sampling_logprobs_mode"] = "support"
-            if int(sampling["top_k"]) <= k:
+            if 0 < top_k <= k:
                 payload.pop("top_logprobs_num", None)
                 return "native_support"
     payload["top_logprobs_num"] = k
